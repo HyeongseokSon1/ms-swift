@@ -4,6 +4,7 @@
 
 import torch
 import torch.nn.functional as F
+from copy import deepcopy
 from typing import Optional, Union
 
 import torch.nn as nn
@@ -46,10 +47,60 @@ class SDFTTrainer(GKDTrainer):
         super().__init__(model, *_args, **kwargs)
 
         self.sdft_alpha = getattr(args, 'sdft_alpha', 1.0)
+        self.sdft_demo_prefix = getattr(args, 'sdft_demo_prefix', 'Reference answer: ')
 
         logger.info(f'SDFT initialized with sdft_alpha={self.sdft_alpha} '
                      f'({"reverse KL" if self.sdft_alpha == 1 else "forward KL" if self.sdft_alpha == 0 else "GJS"}), '
                      f'beta(temperature)={self.beta}, temperature={self.temperature}')
+
+    def _build_opsd_teacher_data(self, inputs):
+        """Build teacher data for SDFT.
+
+        If `teacher_prompt` exists in the data, uses it directly (same as GKD OPSD).
+        Otherwise, auto-generates the teacher prompt by appending the assistant's
+        response as a demonstration to the original user query.
+
+        Example (auto-generated):
+          Student: "Solve: 2x + 3 = 7"
+          Teacher: "Solve: 2x + 3 = 7\n\nReference answer: x = 2\n\nNow answer with your own response."
+        """
+        teacher_data = []
+        for data in inputs:
+            teacher_item = {k: v for k, v in data.items() if k != 'teacher_prompt'}
+            messages = [dict(m) for m in data.get('messages', [])]
+
+            if 'teacher_prompt' in data and data['teacher_prompt']:
+                # Use explicit teacher_prompt
+                teacher_prompt = data['teacher_prompt']
+            else:
+                # Auto-generate: find the last user message and assistant response
+                user_content = None
+                assistant_content = None
+                for msg in messages:
+                    if msg['role'] == 'user':
+                        user_content = msg['content']
+                    elif msg['role'] == 'assistant':
+                        assistant_content = msg['content']
+
+                if user_content is None or assistant_content is None:
+                    return None  # Cannot build teacher data without both user and assistant
+
+                teacher_prompt = (
+                    f'{user_content}\n\n'
+                    f'{self.sdft_demo_prefix}{assistant_content}\n\n'
+                    f'Now answer with your own response.'
+                )
+
+            # Remove assistant message, replace last user message with teacher_prompt
+            if messages and messages[-1]['role'] == 'assistant':
+                messages.pop()
+            for msg in reversed(messages):
+                if msg['role'] == 'user':
+                    msg['content'] = teacher_prompt
+                    break
+            teacher_item['messages'] = messages
+            teacher_data.append(teacher_item)
+        return teacher_data
 
     def _compute_jsd_loss(self, outputs_student, outputs_teacher, inputs, opsd_teacher_inputs):
         """Override GKD's JSD loss to use SDFT's KL divergence.

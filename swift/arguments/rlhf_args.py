@@ -261,6 +261,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     offload_teacher_model: bool = False
     # SDFT
     sdft_alpha: float = 1.0
+    sdft_demo_prefix: str = 'Reference answer: '
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
 

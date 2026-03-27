@@ -102,6 +102,7 @@ class SDFTConfig(GKDConfig):
             0 < alpha < 1 = Generalized Jensen-Shannon
     """
     sdft_alpha: float = 1.0
+    sdft_demo_prefix: str = 'Reference answer: '
 
     def __post_init__(self):
         # SDFT always uses on-policy generation
