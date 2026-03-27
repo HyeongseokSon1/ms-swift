@@ -9,7 +9,7 @@ from swift.utils import get_current_device, get_logger, is_master, is_mp, json_p
 from .sft_args import SftArguments
 
 logger = get_logger()
-rlhf_support_vllm_types = ['grpo', 'gkd']
+rlhf_support_vllm_types = ['grpo', 'gkd', 'sdft']
 
 
 @dataclass
@@ -168,7 +168,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
     Args:
         rlhf_type (str): The type of human alignment algorithm to use. Supports 'dpo', 'orpo', 'simpo', 'kto', 'cpo',
-            'rm', 'ppo', 'grpo', and 'gkd'. Defaults to 'dpo'.
+            'rm', 'ppo', 'grpo', 'gkd', and 'sdft'. Defaults to 'dpo'.
         ref_model (Optional[str]): The model path for the reference model. Required when using 'dpo', 'kto', 'ppo',
             or 'grpo' with full-parameter training. Defaults to None, which will set it to the value of the `--model`
             argument.
@@ -221,8 +221,11 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             training. Defaults to False.
         max_new_tokens (Optional[int]): A backward-compatibility argument. Please use `max_completion_length` instead.
             Defaults to None.
+        sdft_alpha (float): The alpha parameter for SDFT controlling the KL divergence variant.
+            0 = Forward KL: KL(Teacher || Student), 1 = Reverse KL: KL(Student || Teacher) [paper default],
+            0 < alpha < 1 = Generalized Jensen-Shannon. Defaults to 1.0.
     """
-    rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo', 'rm', 'ppo', 'grpo', 'gkd'] = 'dpo'
+    rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo', 'rm', 'ppo', 'grpo', 'gkd', 'sdft'] = 'dpo'
     ref_model: Optional[str] = None
     ref_adapters: List[str] = field(default_factory=list)
     ref_model_type: Optional[str] = field(
@@ -256,6 +259,8 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     seq_kd: bool = False
     gkd_logits_topk: Optional[int] = None
     offload_teacher_model: bool = False
+    # SDFT
+    sdft_alpha: float = 1.0
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
 
@@ -278,6 +283,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         self._check_sequence_parallel()
         self._check_grpo()
         self._check_gkd()
+        self._check_sdft()
 
         if self.loss_scale is None:
             if self.rlhf_type == 'orpo' and not self.model_meta.is_multimodal:
@@ -402,7 +408,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         self._external_vllm_warning()
 
     def _init_padding_side(self):
-        if self.rlhf_type in {'ppo', 'gkd'}:
+        if self.rlhf_type in {'ppo', 'gkd', 'sdft'}:
             self.padding_side = 'left'
             # TODO: streaming, MLLM
 
@@ -451,6 +457,8 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     def _set_default(self):
         if self.beta is None:
             if self.rlhf_type == 'gkd':
+                self.beta = 0.5
+            elif self.rlhf_type == 'sdft':
                 self.beta = 0.5
             else:
                 self.beta = 0.1
@@ -517,7 +525,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     def _check_padding_free(self):
         super()._check_padding_free()
         if self.padding_free or self.packing:
-            supported_types = ['grpo', 'dpo', 'kto', 'gkd']
+            supported_types = ['grpo', 'dpo', 'kto', 'gkd', 'sdft']
             if self.rlhf_type not in supported_types:
                 raise NotImplementedError(
                     f"The current rlhf_type '{self.rlhf_type}' does not support padding_free/packing. "
@@ -604,3 +612,33 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
         if self.teacher_model_server and self.seq_kd:
             raise NotImplementedError('Sequential KD is not supported when using teacher_model_server')
+
+    def _check_sdft(self):
+        if self.rlhf_type != 'sdft':
+            return
+
+        # SDFT always uses on-policy generation
+        self.lmbda = 1.0
+
+        if is_mp() and self.use_vllm:
+            raise ValueError('SDFT with vLLM is not compatible with `device_map`. '
+                             'Please set NPROC_PER_NODE equal to num_processes.')
+
+        if self.multi_turn_scheduler is not None:
+            raise NotImplementedError('Currently, multi_turn_scheduler is not supported for SDFT.')
+
+        if self.async_generate:
+            raise NotImplementedError('Currently, async_generate is not supported for SDFT.')
+
+        if self.teacher_model is not None:
+            raise ValueError('SDFT uses self-distillation and does not support a separate teacher_model. '
+                             'Use `teacher_prompt` in the dataset to provide demonstrations.')
+
+        if self.teacher_model_server is not None:
+            raise ValueError('SDFT uses self-distillation and does not support teacher_model_server.')
+
+        if not (0 <= self.sdft_alpha <= 1):
+            raise ValueError(f'sdft_alpha must be in [0, 1], got {self.sdft_alpha}')
+
+        # Self-distillation: no separate teacher
+        self._teacher_use_disable_adapter = False
