@@ -165,6 +165,17 @@ def load_image(image: Union[str, bytes, Image.Image]) -> Image.Image:
     image = load_file(image)
     if isinstance(image, BytesIO):
         image = Image.open(image)
+
+    # Handle palette mode with possible transparency
+    if image.mode == 'P':
+        image = image.convert('RGBA')
+
+    # Handle alpha channel by compositing onto white background
+    if image.mode in ('RGBA', 'LA'):
+        background = Image.new('RGB', image.size, (255, 255, 255))
+        background.paste(image, mask=image.split()[-1])
+        image = background
+
     if image.mode != 'RGB':
         image = image.convert('RGB')
     return image
