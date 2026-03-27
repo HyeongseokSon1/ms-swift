@@ -5,11 +5,13 @@ from swift.utils.import_utils import _LazyModule
 
 if TYPE_CHECKING:
     from .args_mixin import GRPOArgumentsMixin, VllmArguments
-    from .arguments import CPOConfig, DPOConfig, GKDConfig, GRPOConfig, KTOConfig, ORPOConfig, PPOConfig, RewardConfig
+    from .arguments import (CPOConfig, DPOConfig, GKDConfig, GRPOConfig, KTOConfig, ORPOConfig, PPOConfig, RewardConfig,
+                             SDFTConfig)
     from .cpo_trainer import CPOTrainer
     from .dpo_trainer import DPOTrainer
     from .gkd_trainer import GKDTrainer
     from .grpo_trainer import GRPOTrainer
+    from .sdft_trainer import SDFTTrainer
     from .kto_trainer import KTOTrainer
     from .orpo_trainer import ORPOTrainer
     from .ppo_trainer import PPOTrainer
@@ -27,12 +29,14 @@ else:
         'ppo_trainer': ['PPOTrainer'],
         'reward_trainer': ['RewardTrainer'],
         'gkd_trainer': ['GKDTrainer'],
+        'sdft_trainer': ['SDFTTrainer'],
         'rlhf_mixin': ['RLHFTrainerMixin'],
         'args_mixin': ['VllmArguments', 'GRPOArgumentsMixin'],
         'utils': ['patch_lora_merge', 'patch_lora_unmerge', 'round_robin', '_ForwardRedirection'],
         'vllm_client': ['VLLMClient'],
         'arguments':
-        ['DPOConfig', 'CPOConfig', 'KTOConfig', 'ORPOConfig', 'PPOConfig', 'RewardConfig', 'GRPOConfig', 'GKDConfig']
+        ['DPOConfig', 'CPOConfig', 'KTOConfig', 'ORPOConfig', 'PPOConfig', 'RewardConfig', 'GRPOConfig', 'GKDConfig',
+         'SDFTConfig']
     }
 
     import sys

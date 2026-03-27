@@ -93,6 +93,27 @@ class GKDConfig(RolloutTrainerArgumentsMixin, TrainArgumentsMixin, HfGKDConfig):
 
 
 @dataclass
+class SDFTConfig(GKDConfig):
+    """Config for Self-Distillation Fine-Tuning (SDFT).
+
+    SDFT uses the same model as both teacher and student. The teacher sees
+    demonstration-augmented prompts while the student sees the original prompt.
+
+    Args:
+        sdft_alpha: Controls the KL divergence variant.
+            0 = Forward KL: KL(Teacher || Student)
+            1 = Reverse KL: KL(Student || Teacher) [paper default]
+            0 < alpha < 1 = Generalized Jensen-Shannon
+    """
+    sdft_alpha: float = 1.0
+
+    def __post_init__(self):
+        # SDFT always uses on-policy generation
+        self.lmbda = 1.0
+        GKDConfig.__post_init__(self)
+
+
+@dataclass
 class GRPOConfig(GRPOArgumentsMixin, TrainArgumentsMixin, HfGRPOConfig):
 
     def __post_init__(self):

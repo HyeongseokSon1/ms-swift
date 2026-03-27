@@ -114,11 +114,11 @@ class SwiftRLHF(SwiftSft):
         # Handle ref and value models
         for key in ['ref', 'value', 'teacher']:
             setattr(self, f'{key}_model', None)
-            if key == 'ref' and args.rlhf_type == 'gkd':
+            if key == 'ref' and args.rlhf_type in ('gkd', 'sdft'):
                 continue
             if key == 'value' and args.rlhf_type != 'ppo':
                 continue
-            if key == 'teacher' and args.rlhf_type != 'gkd':
+            if key == 'teacher' and args.rlhf_type not in ('gkd', 'sdft'):
                 continue
             model_key = 'reward' if key == 'value' else key
             model_type = getattr(args, f'{model_key}_model_type')
@@ -186,7 +186,7 @@ class SwiftRLHF(SwiftSft):
     def _prepare_template(self) -> None:
         args = self.args
         super()._prepare_template()
-        mode_mapping = {'kto': 'kto', 'gkd': 'train', 'ppo': 'transformers', 'grpo': 'train'}
+        mode_mapping = {'kto': 'kto', 'gkd': 'train', 'sdft': 'train', 'ppo': 'transformers', 'grpo': 'train'}
         self.template.set_mode(mode_mapping.get(args.rlhf_type, 'rlhf'))
 
         if args.rlhf_type == 'ppo':
@@ -224,13 +224,13 @@ class SwiftRLHF(SwiftSft):
                 trainer_kwargs[key] = model
         if hasattr(self, 'reward_template'):
             trainer_kwargs['reward_template'] = self.reward_template
-        if self.args.rlhf_type in ['grpo', 'gkd']:
+        if self.args.rlhf_type in ['grpo', 'gkd', 'sdft']:
             trainer_kwargs['vllm_client'] = self.args.vllm_client
         if self.args.rlhf_type == 'grpo':
             trainer_kwargs['reward_funcs'] = self.args.reward_funcs
             if self.args.chord_sft_dataset:
                 trainer_kwargs['chord_sft_dataset'], _ = self._prepare_chord_sft_dataset()
-        if self.args.rlhf_type == 'gkd':
+        if self.args.rlhf_type in ('gkd', 'sdft'):
             if self.args.teacher_deepspeed:
                 trainer_kwargs['teacher_deepspeed_config'] = self.args.teacher_deepspeed
             trainer_kwargs['gkd_logits_topk'] = self.args.gkd_logits_topk

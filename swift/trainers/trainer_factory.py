@@ -25,6 +25,7 @@ class TrainerFactory:
         'ppo': 'swift.rlhf_trainers.PPOTrainer',
         'grpo': 'swift.rlhf_trainers.GRPOTrainer',
         'gkd': 'swift.rlhf_trainers.GKDTrainer',
+        'sdft': 'swift.rlhf_trainers.SDFTTrainer',
     }
 
     TRAINING_ARGS_MAPPING = {
@@ -42,6 +43,7 @@ class TrainerFactory:
         'ppo': 'swift.rlhf_trainers.PPOConfig',
         'grpo': 'swift.rlhf_trainers.GRPOConfig',
         'gkd': 'swift.rlhf_trainers.GKDConfig',
+        'sdft': 'swift.rlhf_trainers.SDFTConfig',
     }
 
     @staticmethod
