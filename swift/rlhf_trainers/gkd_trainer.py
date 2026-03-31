@@ -515,10 +515,13 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                         teacher_full_mask = torch.cat([teacher_encoded['attention_mask'], response_mask], dim=1)
                         teacher_labels = torch.full_like(teacher_full_ids, -100)
                         teacher_labels[:, t_prompt_len:] = new_labels[:, student_prompt_len:]
+                        teacher_position_ids = teacher_full_mask.cumsum(dim=1) - 1
+                        teacher_position_ids[teacher_position_ids < 0] = 0
                         encoded_inputs['_opsd_teacher_inputs'] = {
                             'input_ids': teacher_full_ids,
                             'attention_mask': teacher_full_mask,
                             'labels': teacher_labels,
+                            'position_ids': teacher_position_ids,
                         }
 
             elif self.seq_kd:
