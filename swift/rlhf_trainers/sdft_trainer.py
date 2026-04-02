@@ -21,7 +21,7 @@ class SDFTTrainer(GKDTrainer):
 
     SDFT uses the same model as both teacher and student:
     - Student: model conditioned on the query only, π(·|x)
-    - Teacher: model conditioned on query + demonstration context, π(·|x, c)
+    - Teacher: EMA of student, conditioned on query + demonstration context, π(·|x, c)
 
     The training minimizes the KL divergence between student and teacher on
     on-policy (student-generated) completions. The `sdft_alpha` parameter
@@ -29,6 +29,9 @@ class SDFTTrainer(GKDTrainer):
     - sdft_alpha=0: Forward KL, KL(Teacher || Student)
     - sdft_alpha=1: Reverse KL, KL(Student || Teacher) [paper default]
     - 0 < sdft_alpha < 1: Generalized Jensen-Shannon divergence
+
+    The teacher model is an Exponential Moving Average (EMA) of the student:
+    θ_ema ← ema_decay * θ_ema + (1 - ema_decay) * θ_student
 
     Data format: Each example should have a `teacher_prompt` field containing
     the demonstration-augmented prompt. The student sees the original prompt,
@@ -44,14 +47,41 @@ class SDFTTrainer(GKDTrainer):
         if args is not None:
             args.lmbda = 1.0
 
+        self.ema_decay = getattr(args, 'ema_decay', 0.99) if args else 0.99
+
+        # Create EMA teacher model if enabled and no external teacher provided
+        if self.ema_decay > 0 and kwargs.get('teacher_model') is None:
+            logger.info(f'Creating EMA teacher model (decay={self.ema_decay})...')
+            ema_teacher = deepcopy(model)
+            for param in ema_teacher.parameters():
+                param.requires_grad = False
+            ema_teacher.eval()
+            kwargs['teacher_model'] = ema_teacher
+
         super().__init__(model, *_args, **kwargs)
 
         self.sdft_alpha = getattr(args, 'sdft_alpha', 1.0)
         self.sdft_demo_prefix = getattr(args, 'sdft_demo_prefix', 'Reference answer: ')
 
+        ema_status = f'decay={self.ema_decay}' if self.ema_decay > 0 else 'disabled (self-distillation)'
         logger.info(f'SDFT initialized with sdft_alpha={self.sdft_alpha} '
                      f'({"reverse KL" if self.sdft_alpha == 1 else "forward KL" if self.sdft_alpha == 0 else "GJS"}), '
-                     f'beta(temperature)={self.beta}, temperature={self.temperature}')
+                     f'temperature={self.temperature}, EMA {ema_status}')
+
+    @torch.no_grad()
+    def _update_ema_teacher(self):
+        """Update EMA teacher: θ_ema ← decay * θ_ema + (1 - decay) * θ_student"""
+        student = self.accelerator.unwrap_model(self.model)
+        teacher = self.accelerator.unwrap_model(self.teacher_model)
+        decay = self.ema_decay
+        for ema_param, student_param in zip(teacher.parameters(), student.parameters()):
+            ema_param.data.mul_(decay).add_(student_param.data, alpha=1.0 - decay)
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        if self.ema_decay > 0 and self.teacher_model is not None:
+            self._update_ema_teacher()
+        return loss
 
     def _build_opsd_teacher_data(self, inputs):
         """Build teacher data for SDFT.
