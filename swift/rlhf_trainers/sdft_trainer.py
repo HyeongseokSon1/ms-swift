@@ -49,16 +49,23 @@ class SDFTTrainer(GKDTrainer):
 
         self.ema_decay = getattr(args, 'ema_decay', 0.99) if args else 0.99
 
-        # Create EMA teacher model if enabled and no external teacher provided
+        # Create EMA teacher copy BEFORE super().__init__(), but don't pass via kwargs
+        # to avoid DeepSpeed/FSDP wrapping (EMA teacher is inference-only).
+        _ema_teacher = None
         if self.ema_decay > 0 and kwargs.get('teacher_model') is None:
             logger.info(f'Creating EMA teacher model (decay={self.ema_decay})...')
-            ema_teacher = deepcopy(model)
-            for param in ema_teacher.parameters():
+            _ema_teacher = deepcopy(model)
+            for param in _ema_teacher.parameters():
                 param.requires_grad = False
-            ema_teacher.eval()
-            kwargs['teacher_model'] = ema_teacher
+            _ema_teacher.eval()
 
         super().__init__(model, *_args, **kwargs)
+
+        # Set up EMA teacher after super().__init__() so accelerator is available.
+        # Bypass GKD's DeepSpeed/FSDP wrapping — EMA teacher doesn't need optimizer/sharding.
+        if _ema_teacher is not None:
+            self.teacher_model = _ema_teacher.to(self.accelerator.device)
+            self._is_self_distillation = False
 
         self.sdft_alpha = getattr(args, 'sdft_alpha', 1.0)
         self.sdft_demo_prefix = getattr(args, 'sdft_demo_prefix', 'Reference answer: ')
