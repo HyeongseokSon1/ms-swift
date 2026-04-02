@@ -104,9 +104,14 @@ class SDFTConfig(GKDConfig):
             0 = Forward KL: KL(Teacher || Student)
             1 = Reverse KL: KL(Student || Teacher) [paper default]
             0 < alpha < 1 = Generalized Jensen-Shannon
+        ema_decay: EMA decay rate for the teacher model.
+            θ_ema ← ema_decay * θ_ema + (1 - ema_decay) * θ_student
+            Paper explores (1-decay) ∈ {0.01, 0.02, 0.05}, i.e. decay ∈ {0.99, 0.98, 0.95}.
+            Set to 0 to disable EMA (falls back to self-distillation via disable_adapter).
     """
     sdft_alpha: float = 1.0
     sdft_demo_prefix: str = 'Reference answer: '
+    ema_decay: float = 0.99
 
     def __post_init__(self):
         # SDFT always uses on-policy generation

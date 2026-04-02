@@ -224,6 +224,11 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         sdft_alpha (float): The alpha parameter for SDFT controlling the KL divergence variant.
             0 = Forward KL: KL(Teacher || Student), 1 = Reverse KL: KL(Student || Teacher) [paper default],
             0 < alpha < 1 = Generalized Jensen-Shannon. Defaults to 1.0.
+        ema_decay (float): EMA decay rate for the SDFT teacher model.
+            θ_ema ← ema_decay * θ_ema + (1 - ema_decay) * θ_student.
+            Paper explores (1-decay) ∈ {0.01, 0.02, 0.05}, i.e. decay ∈ {0.99, 0.98, 0.95}.
+            Set to 0 to disable EMA (falls back to self-distillation via disable_adapter).
+            Defaults to 0.99.
     """
     rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo', 'rm', 'ppo', 'grpo', 'gkd', 'sdft'] = 'dpo'
     ref_model: Optional[str] = None
@@ -262,6 +267,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     # SDFT
     sdft_alpha: float = 1.0
     sdft_demo_prefix: str = 'Reference answer: '
+    ema_decay: float = 0.99
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
 
@@ -640,6 +646,9 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
         if not (0 <= self.sdft_alpha <= 1):
             raise ValueError(f'sdft_alpha must be in [0, 1], got {self.sdft_alpha}')
+
+        if not (0 <= self.ema_decay < 1):
+            raise ValueError(f'ema_decay must be in [0, 1), got {self.ema_decay}')
 
         # Self-distillation: no separate teacher
         self._teacher_use_disable_adapter = False
