@@ -48,24 +48,9 @@ class SDFTTrainer(GKDTrainer):
             args.lmbda = 1.0
 
         self.ema_decay = getattr(args, 'ema_decay', 0.99) if args else 0.99
-
-        # Create EMA teacher copy BEFORE super().__init__(), but don't pass via kwargs
-        # to avoid DeepSpeed/FSDP wrapping (EMA teacher is inference-only).
-        _ema_teacher = None
-        if self.ema_decay > 0 and kwargs.get('teacher_model') is None:
-            logger.info(f'Creating EMA teacher model (decay={self.ema_decay})...')
-            _ema_teacher = deepcopy(model)
-            for param in _ema_teacher.parameters():
-                param.requires_grad = False
-            _ema_teacher.eval()
+        self._ema_on_device = False
 
         super().__init__(model, *_args, **kwargs)
-
-        # Set up EMA teacher after super().__init__() so accelerator is available.
-        # Bypass GKD's DeepSpeed/FSDP wrapping — EMA teacher doesn't need optimizer/sharding.
-        if _ema_teacher is not None:
-            self.teacher_model = _ema_teacher.to(self.accelerator.device)
-            self._is_self_distillation = False
 
         self.sdft_alpha = getattr(args, 'sdft_alpha', 1.0)
         self.sdft_demo_prefix = getattr(args, 'sdft_demo_prefix', 'Reference answer: ')
@@ -75,16 +60,41 @@ class SDFTTrainer(GKDTrainer):
                      f'({"reverse KL" if self.sdft_alpha == 1 else "forward KL" if self.sdft_alpha == 0 else "GJS"}), '
                      f'temperature={self.temperature}, EMA {ema_status}')
 
+    def train(self, *args, **kwargs):
+        """Create EMA teacher before training starts.
+
+        This is done in train() rather than __init__() so that:
+        1. The model is in a stable state (fully loaded, not yet DS/FSDP wrapped)
+        2. mixin.py:train() can register multimodal hooks on the teacher
+        3. Device placement is deferred to first training_step to avoid issues
+        """
+        if self.ema_decay > 0 and self.teacher_model is None:
+            logger.info(f'Creating EMA teacher model (decay={self.ema_decay})...')
+            ema_teacher = deepcopy(self.model)
+            for param in ema_teacher.parameters():
+                param.requires_grad = False
+            ema_teacher.eval()
+            self.teacher_model = ema_teacher
+            self._is_self_distillation = False
+        return super().train(*args, **kwargs)
+
     @torch.no_grad()
     def _update_ema_teacher(self):
         """Update EMA teacher: θ_ema ← decay * θ_ema + (1 - decay) * θ_student"""
         student = self.accelerator.unwrap_model(self.model)
-        teacher = self.accelerator.unwrap_model(self.teacher_model)
+        teacher = self.teacher_model
         decay = self.ema_decay
         for ema_param, student_param in zip(teacher.parameters(), student.parameters()):
             ema_param.data.mul_(decay).add_(student_param.data, alpha=1.0 - decay)
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        # Lazily move EMA teacher to GPU on first training step.
+        # At this point the student is already on GPU (wrapped by DeepSpeed/FSDP).
+        if self.ema_decay > 0 and self.teacher_model is not None and not self._ema_on_device:
+            self.teacher_model = self.teacher_model.to(self.accelerator.device)
+            self._ema_on_device = True
+            logger.info(f'EMA teacher moved to {self.accelerator.device}')
+
         loss = super().training_step(model, inputs, num_items_in_batch)
         if self.ema_decay > 0 and self.teacher_model is not None:
             self._update_ema_teacher()
