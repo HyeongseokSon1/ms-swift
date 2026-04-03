@@ -53,15 +53,30 @@ class SDFTTrainer(GKDTrainer):
                      f'({"reverse KL" if self.sdft_alpha == 1 else "forward KL" if self.sdft_alpha == 0 else "GJS"}), '
                      f'temperature={self.temperature}, EMA {ema_status}')
 
+    @staticmethod
+    def _get_param_data(param):
+        """Get stored parameter data: ds_tensor for ZeRO-3, param.data otherwise."""
+        if hasattr(param, 'ds_tensor'):
+            return param.ds_tensor.data
+        return param.data
+
+    @staticmethod
+    def _set_param_data(param, data):
+        """Set parameter data: ds_tensor for ZeRO-3, param.data otherwise."""
+        if hasattr(param, 'ds_tensor'):
+            param.ds_tensor.data.copy_(data)
+        else:
+            param.data.copy_(data)
+
     def _init_ema_params(self):
         """Initialize EMA parameter storage by cloning current model parameters.
 
-        Works with DeepSpeed ZeRO-3: clones the partitioned parameter data on each rank,
-        so no extra cross-rank communication or full model copy is needed.
+        For DeepSpeed ZeRO-3, clones ds_tensor (local partition) instead of param.data
+        (which is empty/size-0 when not gathered).
         """
         unwrapped = self.accelerator.unwrap_model(self.model)
         self._ema_params = {
-            name: param.data.clone()
+            name: self._get_param_data(param).clone()
             for name, param in unwrapped.named_parameters()
         }
         logger.info(f'EMA parameters initialized ({len(self._ema_params)} params)')
@@ -72,7 +87,7 @@ class SDFTTrainer(GKDTrainer):
         unwrapped = self.accelerator.unwrap_model(self.model)
         decay = self.ema_decay
         for name, param in unwrapped.named_parameters():
-            self._ema_params[name].mul_(decay).add_(param.data, alpha=1.0 - decay)
+            self._ema_params[name].mul_(decay).add_(self._get_param_data(param), alpha=1.0 - decay)
 
     @contextmanager
     def _ema_weight_context(self):
@@ -80,13 +95,13 @@ class SDFTTrainer(GKDTrainer):
         unwrapped = self.accelerator.unwrap_model(self.model)
         student_params = {}
         for name, param in unwrapped.named_parameters():
-            student_params[name] = param.data.clone()
-            param.data.copy_(self._ema_params[name])
+            student_params[name] = self._get_param_data(param).clone()
+            self._set_param_data(param, self._ema_params[name])
         try:
             yield
         finally:
             for name, param in unwrapped.named_parameters():
-                param.data.copy_(student_params[name])
+                self._set_param_data(param, student_params[name])
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if self.ema_decay <= 0 or self._ema_params is None:
