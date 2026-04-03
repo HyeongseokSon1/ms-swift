@@ -4,14 +4,15 @@
 
 import torch
 import torch.nn.functional as F
-from copy import deepcopy
+from contextlib import contextmanager
 from typing import Optional, Union
 
 import torch.nn as nn
 from transformers import PreTrainedModel
 
+from swift.trainers import disable_gradient_checkpointing
 from swift.utils import get_logger
-from .gkd_trainer import GKDTrainer
+from .gkd_trainer import DataSource, GKDTrainer
 
 logger = get_logger()
 
@@ -23,19 +24,11 @@ class SDFTTrainer(GKDTrainer):
     - Student: model conditioned on the query only, π(·|x)
     - Teacher: EMA of student, conditioned on query + demonstration context, π(·|x, c)
 
-    The training minimizes the KL divergence between student and teacher on
-    on-policy (student-generated) completions. The `sdft_alpha` parameter
-    controls the KL variant:
-    - sdft_alpha=0: Forward KL, KL(Teacher || Student)
-    - sdft_alpha=1: Reverse KL, KL(Student || Teacher) [paper default]
-    - 0 < sdft_alpha < 1: Generalized Jensen-Shannon divergence
+    The teacher uses EMA weights swapped into the same model for forward pass.
+    This avoids needing a separate model copy and works with DeepSpeed ZeRO-2/3
+    since only the local parameter data (partitioned for ZeRO-3) is cloned.
 
-    The teacher model is an Exponential Moving Average (EMA) of the student:
     θ_ema ← ema_decay * θ_ema + (1 - ema_decay) * θ_student
-
-    Data format: Each example should have a `teacher_prompt` field containing
-    the demonstration-augmented prompt. The student sees the original prompt,
-    while the teacher sees the teacher_prompt (which includes demonstrations).
 
     Reference: https://arxiv.org/abs/2601.19897
     """
@@ -48,7 +41,7 @@ class SDFTTrainer(GKDTrainer):
             args.lmbda = 1.0
 
         self.ema_decay = getattr(args, 'ema_decay', 0.99) if args else 0.99
-        self._ema_on_device = False
+        self._ema_params = None  # Initialized lazily on first training step
 
         super().__init__(model, *_args, **kwargs)
 
@@ -60,44 +53,92 @@ class SDFTTrainer(GKDTrainer):
                      f'({"reverse KL" if self.sdft_alpha == 1 else "forward KL" if self.sdft_alpha == 0 else "GJS"}), '
                      f'temperature={self.temperature}, EMA {ema_status}')
 
-    def train(self, *args, **kwargs):
-        """Create EMA teacher before training starts.
+    def _init_ema_params(self):
+        """Initialize EMA parameter storage by cloning current model parameters.
 
-        This is done in train() rather than __init__() so that:
-        1. The model is in a stable state (fully loaded, not yet DS/FSDP wrapped)
-        2. mixin.py:train() can register multimodal hooks on the teacher
-        3. Device placement is deferred to first training_step to avoid issues
+        Works with DeepSpeed ZeRO-3: clones the partitioned parameter data on each rank,
+        so no extra cross-rank communication or full model copy is needed.
         """
-        if self.ema_decay > 0 and self.teacher_model is None:
-            logger.info(f'Creating EMA teacher model (decay={self.ema_decay})...')
-            ema_teacher = deepcopy(self.model)
-            for param in ema_teacher.parameters():
-                param.requires_grad = False
-            ema_teacher.eval()
-            self.teacher_model = ema_teacher
-            self._is_self_distillation = False
-        return super().train(*args, **kwargs)
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        self._ema_params = {
+            name: param.data.clone()
+            for name, param in unwrapped.named_parameters()
+        }
+        logger.info(f'EMA parameters initialized ({len(self._ema_params)} params)')
 
     @torch.no_grad()
-    def _update_ema_teacher(self):
-        """Update EMA teacher: θ_ema ← decay * θ_ema + (1 - decay) * θ_student"""
-        student = self.accelerator.unwrap_model(self.model)
-        teacher = self.teacher_model
+    def _update_ema_params(self):
+        """Update EMA parameters: θ_ema ← decay * θ_ema + (1 - decay) * θ_student"""
+        unwrapped = self.accelerator.unwrap_model(self.model)
         decay = self.ema_decay
-        for ema_param, student_param in zip(teacher.parameters(), student.parameters()):
-            ema_param.data.mul_(decay).add_(student_param.data, alpha=1.0 - decay)
+        for name, param in unwrapped.named_parameters():
+            self._ema_params[name].mul_(decay).add_(param.data, alpha=1.0 - decay)
+
+    @contextmanager
+    def _ema_weight_context(self):
+        """Swap model weights to EMA for teacher forward, then restore student weights."""
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        student_params = {}
+        for name, param in unwrapped.named_parameters():
+            student_params[name] = param.data.clone()
+            param.data.copy_(self._ema_params[name])
+        try:
+            yield
+        finally:
+            for name, param in unwrapped.named_parameters():
+                param.data.copy_(student_params[name])
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if self.ema_decay <= 0 or self._ema_params is None:
+            # EMA disabled or not yet initialized: use parent's compute_loss
+            return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+
+        # --- EMA-enabled path: use self-distillation with EMA weight swap ---
+        data_source = inputs.pop('_data_source', DataSource.DATASET)
+        inputs.pop('_teacher_api_logprobs', None)
+        inputs.pop('_teacher_api_indices', None)
+        opsd_teacher_inputs = inputs.pop('_opsd_teacher_inputs', None)
+
+        model_inputs = {k: v for k, v in inputs.items() if k not in {'prompt', 'labels'}}
+
+        if opsd_teacher_inputs is not None:
+            teacher_fwd_inputs = {k: v for k, v in model_inputs.items()}
+            teacher_fwd_inputs.update({k: v for k, v in opsd_teacher_inputs.items() if k != 'labels'})
+        else:
+            teacher_fwd_inputs = None
+
+        # Student forward (current weights)
+        if self.args.sft_alpha > 0:
+            model_inputs['labels'] = inputs['labels']
+        outputs_student = model(**model_inputs)
+
+        # Teacher forward (EMA weights swapped in temporarily)
+        t_fwd = teacher_fwd_inputs if teacher_fwd_inputs is not None else {
+            k: v for k, v in model_inputs.items() if k != 'labels'
+        }
+
+        with torch.no_grad(), self._ema_weight_context(), \
+                disable_gradient_checkpointing(model, self.args.gradient_checkpointing_kwargs):
+            outputs_teacher = model(**t_fwd)
+
+        loss = self._compute_jsd_loss(outputs_student, outputs_teacher, inputs, opsd_teacher_inputs)
+
+        if self.args.sft_alpha > 0 and data_source != DataSource.STUDENT:
+            loss = loss + self.args.sft_alpha * outputs_student.loss
+
+        if return_outputs:
+            return (loss, outputs_student)
+        return loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        # Lazily move EMA teacher to GPU on first training step.
-        # At this point the student is already on GPU (wrapped by DeepSpeed/FSDP).
-        if self.ema_decay > 0 and self.teacher_model is not None and not self._ema_on_device:
-            self.teacher_model = self.teacher_model.to(self.accelerator.device)
-            self._ema_on_device = True
-            logger.info(f'EMA teacher moved to {self.accelerator.device}')
+        # Initialize EMA params on first step (model is fully on device by now)
+        if self.ema_decay > 0 and self._ema_params is None:
+            self._init_ema_params()
 
         loss = super().training_step(model, inputs, num_items_in_batch)
-        if self.ema_decay > 0 and self.teacher_model is not None:
-            self._update_ema_teacher()
+
+        if self.ema_decay > 0 and self._ema_params is not None:
+            self._update_ema_params()
         return loss
 
     def _build_opsd_teacher_data(self, inputs):
@@ -150,11 +191,7 @@ class SDFTTrainer(GKDTrainer):
         return teacher_data
 
     def _compute_jsd_loss(self, outputs_student, outputs_teacher, inputs, opsd_teacher_inputs):
-        """Override GKD's JSD loss to use SDFT's KL divergence.
-
-        Uses sdft_alpha to control the KL variant instead of GKD's beta for JSD.
-        The beta parameter from GKDConfig is used as temperature here.
-        """
+        """Override GKD's JSD loss to use SDFT's KL divergence."""
         if opsd_teacher_inputs is not None:
             student_shifted = torch.roll(inputs['labels'], shifts=-1, dims=1)
             teacher_shifted = torch.roll(opsd_teacher_inputs['labels'], shifts=-1, dims=1)
