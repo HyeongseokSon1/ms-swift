@@ -30,6 +30,7 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
     def __init__(self, *args, **kwargs):
         # MoL: pop kwargs before HfTrainer's strict signature check.
         self.mol_train_dataset = kwargs.pop('mol_train_dataset', None)
+        self.mol_template = kwargs.pop('mol_template', None)
         self.ref_model = kwargs.pop('ref_model', None)
         super().__init__(*args, **kwargs)
         self.model_accepts_loss_kwargs = True  # fix transformers>=4.46.2
@@ -38,6 +39,13 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
                 self.model, template=self.template, max_batch_size=self.args.per_device_eval_batch_size)
         self.jsonl_writer = JsonlWriter(os.path.join(self.args.output_dir, 'predict.jsonl'))
         self._mol_kl_iter = None
+        # Build a KL-side data_collator when a separate template is supplied; otherwise reuse the main one.
+        if self.mol_template is not None:
+            from functools import partial
+            padding_to = self.mol_template.max_length if self.args.tuner_type == 'longlora' else None
+            self.mol_data_collator = partial(self.mol_template.data_collator, padding_to=padding_to)
+        else:
+            self.mol_data_collator = None
         if self.ref_model is not None:
             # Move/wrap the frozen reference model onto the accelerator device for inference,
             # matching the conventions used by ms-swift RLHF trainers.
@@ -259,12 +267,23 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
                 and self.model.training)
 
     def _build_mol_kl_dataloader(self):
-        orig = self.train_dataset
+        orig_ds = self.train_dataset
+        orig_collator = self.data_collator
+        orig_bs = self._train_batch_size
         self.train_dataset = self.mol_train_dataset
+        if self.mol_data_collator is not None:
+            self.data_collator = self.mol_data_collator
+        kl_bs = self.args.mol_kl_per_device_batch_size
+        if kl_bs is not None and kl_bs > 0:
+            # Scale `_train_batch_size` by the per-device ratio so dist sharding stays consistent.
+            factor = kl_bs / max(1, self.args.per_device_train_batch_size)
+            self._train_batch_size = max(1, int(round(orig_bs * factor)))
         try:
             return self.get_train_dataloader()
         finally:
-            self.train_dataset = orig
+            self.train_dataset = orig_ds
+            self.data_collator = orig_collator
+            self._train_batch_size = orig_bs
 
     def _next_mol_kl_batch(self):
         if self._mol_kl_iter is None:
@@ -312,10 +331,11 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
         for k in ('compute_loss_func', 'loss_scale', 'text_position_ids', 'channel', 'logits_to_keep'):
             inputs.pop(k, None)
         labels = inputs.pop('labels')
-        with self.template.forward_context(self.model, inputs):
+        kl_template = self.mol_template if self.mol_template is not None else self.template
+        with kl_template.forward_context(self.model, inputs):
             student_out = model(**inputs)
         if self.ref_model is not None:
-            with torch.no_grad(), self.template.forward_context(self.ref_model, inputs):
+            with torch.no_grad(), kl_template.forward_context(self.ref_model, inputs):
                 ref_out = self.ref_model(**inputs)
             ref_logits = ref_out.logits
         else:
@@ -325,7 +345,7 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
                     'MoL requires either `--mol_ref_model`, full-parameter training '
                     '(auto-snapshot reference), or a PEFT model so the frozen base can be reached '
                     'via `disable_adapter`.')
-            with torch.no_grad(), unwrapped.disable_adapter(), self.template.forward_context(self.model, inputs):
+            with torch.no_grad(), unwrapped.disable_adapter(), kl_template.forward_context(self.model, inputs):
                 ref_out = model(**inputs)
             ref_logits = ref_out.logits
         return self._mol_kl_divergence(student_out.logits, ref_logits, labels)

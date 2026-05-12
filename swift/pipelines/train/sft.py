@@ -27,9 +27,11 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         super().__init__(args)
         self.train_msg = {}
         self.mol_train_dataset = None
+        self.mol_template = None
         self.ref_model = None
         self._prepare_model_tokenizer()
         self._prepare_template()
+        self._prepare_mol_template()
         self._prepare_flash_ckpt()
 
     @RayHelper.function(group='default')
@@ -140,6 +142,34 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         return datasets
 
     @RayHelper.function(group='default')
+    def _prepare_mol_template(self):
+        """Build a second template instance for the KL-side dataset when any --mol_template* override is set."""
+        from swift.template import get_template
+        args = self.args
+        if getattr(args, 'mol_kl_coef', 0.0) <= 0 or not getattr(args, 'mol_dataset', None):
+            return
+        overrides_set = any(getattr(args, k, None) is not None
+                            for k in ('mol_template', 'mol_system', 'mol_use_chat_template', 'mol_loss_scale'))
+        if not overrides_set:
+            # KL side will reuse the main template; nothing to build.
+            return
+        kwargs = args.get_template_kwargs()
+        if args.mol_template is not None:
+            kwargs['template_type'] = args.mol_template
+        if args.mol_system is not None:
+            kwargs['default_system'] = args.mol_system
+        if args.mol_use_chat_template is not None:
+            kwargs['use_chat_template'] = args.mol_use_chat_template
+        if args.mol_loss_scale is not None:
+            kwargs['loss_scale'] = args.mol_loss_scale
+        mol_template = get_template(self.processor, **kwargs)
+        mol_template.set_mode('train')
+        if mol_template.use_model:
+            mol_template.model = self.model
+        self.mol_template = mol_template
+        logger.info(f'mol_template (KL-side): {mol_template}')
+
+    @RayHelper.function(group='default')
     def _prepare_mol_dataset(self, pre_process: bool = True):
         """Load and encode the separate MoL KL-side dataset (--mol_dataset)."""
         args = self.args
@@ -155,9 +185,19 @@ class SwiftSft(SwiftPipeline, TunerMixin):
             split_dataset_ratio=0.,
             shuffle=args.dataset_shuffle,
             **dataset_kwargs)
-        mol_dataset, _ = self._encode_dataset(mol_dataset, None, pre_process=pre_process)
-        if pre_process:
-            mol_dataset, _ = self._post_process_datasets([mol_dataset, None])
+        # Encode/post-process using the KL-side template when overrides are set, else fall back
+        # to the main template. We swap self.template temporarily so the existing helpers stay simple.
+        kl_template = self.mol_template
+        if kl_template is not None:
+            orig_template = self.template
+            self.template = kl_template
+        try:
+            mol_dataset, _ = self._encode_dataset(mol_dataset, None, pre_process=pre_process)
+            if pre_process:
+                mol_dataset, _ = self._post_process_datasets([mol_dataset, None])
+        finally:
+            if kl_template is not None:
+                self.template = orig_template
         self.mol_train_dataset = mol_dataset
         logger.info(f'mol_train_dataset (KL-side): {mol_dataset}')
 
@@ -255,6 +295,8 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         kwargs = {}
         if self.mol_train_dataset is not None:
             kwargs['mol_train_dataset'] = self.mol_train_dataset
+        if self.mol_template is not None:
+            kwargs['mol_template'] = self.mol_template
         if self.ref_model is not None:
             kwargs['ref_model'] = self.ref_model
         return kwargs

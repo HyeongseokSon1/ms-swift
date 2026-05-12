@@ -188,6 +188,19 @@ class SftArguments(SwanlabArguments, TunerArguments, BaseArguments, Seq2SeqTrain
     mol_ref_model_type: Optional[str] = None
     mol_ref_model_revision: Optional[str] = None
 
+    # MoL: template overrides for the KL-side dataset. Useful when CE and KL datasets need different
+    # tokenization/masking conventions (e.g. plain-text pretraining for CE + chat-format
+    # instruction-following corpus for KL). Each value falls back to the corresponding main argument
+    # (`--template`, `--system`, `--use_chat_template`, `--loss_scale`) when left unset.
+    mol_template: Optional[str] = None
+    mol_system: Optional[str] = None
+    mol_use_chat_template: Optional[bool] = None
+    mol_loss_scale: Optional[str] = None
+
+    # MoL: per-device batch size for the KL side. Defaults to `--per_device_train_batch_size`
+    # (1:1 ratio, matching the paper's recommendation). Set lower to reduce KL contribution.
+    mol_kl_per_device_batch_size: Optional[int] = None
+
     def _check_padding_free(self):
         if self.padding_free or self.packing:
             if self.packing:

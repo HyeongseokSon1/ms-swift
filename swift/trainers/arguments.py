@@ -209,6 +209,7 @@ class TrainArgumentsMixin:
     mol_kl_type: Literal['reverse', 'forward', 'jsd'] = 'reverse'
     mol_kl_temperature: float = 1.0
     mol_kl_jsd_beta: float = 0.5  # only used when mol_kl_type == 'jsd'
+    mol_kl_per_device_batch_size: Optional[int] = None  # defaults to per_device_train_batch_size
 
     @staticmethod
     def _patch_liger_kernel():
