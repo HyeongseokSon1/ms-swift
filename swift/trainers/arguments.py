@@ -202,6 +202,14 @@ class TrainArgumentsMixin:
     # dlrover flash_checkpoint
     use_flash_ckpt: bool = False
 
+    # MoL (Mixture of Losses, arxiv 2505.12043): combine CE on the primary dataset with a KL-to-reference
+    # term computed on `--mol_dataset`. The reference model is the frozen base LLM (defaults to a snapshot
+    # of `--model` at training start). Set `--mol_kl_coef > 0` to enable.
+    mol_kl_coef: float = 0.0
+    mol_kl_type: Literal['reverse', 'forward', 'jsd'] = 'reverse'
+    mol_kl_temperature: float = 1.0
+    mol_kl_jsd_beta: float = 0.5  # only used when mol_kl_type == 'jsd'
+
     @staticmethod
     def _patch_liger_kernel():
         # fix logits_to_keep

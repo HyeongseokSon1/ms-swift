@@ -181,6 +181,13 @@ class SftArguments(SwanlabArguments, TunerArguments, BaseArguments, Seq2SeqTrain
     # fsdp
     fsdp: Optional[str] = None
 
+    # MoL: explicit reference model. When None and MoL is enabled (mol_kl_coef > 0), the trainer
+    # uses a snapshot of the base `--model` (frozen at training start) as the reference. Only supported
+    # for full-parameter training; with LoRA, the frozen base weights are reused via `disable_adapter`.
+    mol_ref_model: Optional[str] = None
+    mol_ref_model_type: Optional[str] = None
+    mol_ref_model_revision: Optional[str] = None
+
     def _check_padding_free(self):
         if self.padding_free or self.packing:
             if self.packing:

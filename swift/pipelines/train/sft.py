@@ -26,6 +26,8 @@ class SwiftSft(SwiftPipeline, TunerMixin):
     def __init__(self, args: Optional[Union[List[str], SftArguments]] = None) -> None:
         super().__init__(args)
         self.train_msg = {}
+        self.mol_train_dataset = None
+        self.ref_model = None
         self._prepare_model_tokenizer()
         self._prepare_template()
         self._prepare_flash_ckpt()
@@ -130,10 +132,34 @@ class SwiftSft(SwiftPipeline, TunerMixin):
             logger.info(f'val_dataset: {val_dataset}')
         datasets = [train_dataset, val_dataset]
         if not pre_process:
+            self._prepare_mol_dataset(pre_process=pre_process)
             return datasets
         datasets = self._post_process_datasets(datasets)
         self._show_dataset(*datasets)
+        self._prepare_mol_dataset(pre_process=pre_process)
         return datasets
+
+    @RayHelper.function(group='default')
+    def _prepare_mol_dataset(self, pre_process: bool = True):
+        """Load and encode the separate MoL KL-side dataset (--mol_dataset)."""
+        args = self.args
+        if not getattr(args, 'mol_dataset', None):
+            return
+        if getattr(args, 'mol_kl_coef', 0.0) <= 0:
+            logger.warning('`--mol_dataset` is set but `--mol_kl_coef` is 0; MoL KL term is disabled.')
+            return
+        dataset_kwargs = args.get_dataset_kwargs()
+        dataset_kwargs.pop('interleave_prob', None)
+        mol_dataset, _ = load_dataset(
+            args.mol_dataset,
+            split_dataset_ratio=0.,
+            shuffle=args.dataset_shuffle,
+            **dataset_kwargs)
+        mol_dataset, _ = self._encode_dataset(mol_dataset, None, pre_process=pre_process)
+        if pre_process:
+            mol_dataset, _ = self._post_process_datasets([mol_dataset, None])
+        self.mol_train_dataset = mol_dataset
+        logger.info(f'mol_train_dataset (KL-side): {mol_dataset}')
 
     def _post_process_datasets(self, datasets: List) -> List:
         args = self.args
@@ -169,6 +195,33 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         return datasets
 
     @RayHelper.function(group='default')
+    def _prepare_mol_ref_model(self):
+        """Load the frozen reference model for MoL.
+
+        - When `--mol_ref_model` is given, load it explicitly.
+        - Else, for full-parameter training, load a fresh snapshot of `--model` (frozen at training start).
+        - For LoRA, do not load a second model; the trainer reuses the frozen base via `disable_adapter`.
+        """
+        args = self.args
+        if getattr(args, 'mol_kl_coef', 0.0) <= 0 or not getattr(args, 'mol_dataset', None):
+            return
+        if args.tuner_type != 'full':
+            logger.info('MoL with LoRA/adapter training: reusing frozen base via disable_adapter; '
+                        'no separate reference model will be loaded.')
+            return
+        ref_model_id = args.mol_ref_model or args.model
+        logger.info(f'Loading MoL reference model (frozen): {ref_model_id}')
+        ref_model, _ = args.get_model_processor(
+            model=ref_model_id,
+            model_type=args.mol_ref_model_type or args.model_type,
+            revision=args.mol_ref_model_revision or args.model_revision,
+        )
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad = False
+        self.ref_model = ref_model
+
+    @RayHelper.function(group='default')
     def run(self):
         args = self.args
         train_dataset, val_dataset = self._prepare_dataset()
@@ -185,6 +238,8 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         self.train_msg['model_parameter_info'] = model_parameter_info
         logger.info(f'model_parameter_info: {model_parameter_info}')
 
+        self._prepare_mol_ref_model()
+
         trainer_cls = TrainerFactory.get_trainer_cls(args)
         trainer = trainer_cls(
             model=self.model,
@@ -197,7 +252,12 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         return self.train(trainer)
 
     def _get_trainer_kwargs(self):
-        return {}
+        kwargs = {}
+        if self.mol_train_dataset is not None:
+            kwargs['mol_train_dataset'] = self.mol_train_dataset
+        if self.ref_model is not None:
+            kwargs['ref_model'] = self.ref_model
+        return kwargs
 
     def _handle_trainer_state(self, trainer, is_write_rank: bool):
         state = trainer.state

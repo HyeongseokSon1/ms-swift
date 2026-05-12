@@ -1,8 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Part of the implementation is borrowed from huggingface/transformers.
 import inspect
+import math
 import os
 import torch
+import torch.nn.functional as F
 from contextlib import contextmanager, nullcontext
 from peft import PeftModel
 from torch import nn
@@ -26,12 +28,29 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
     args: Seq2SeqTrainingArguments
 
     def __init__(self, *args, **kwargs):
+        # MoL: pop kwargs before HfTrainer's strict signature check.
+        self.mol_train_dataset = kwargs.pop('mol_train_dataset', None)
+        self.ref_model = kwargs.pop('ref_model', None)
         super().__init__(*args, **kwargs)
         self.model_accepts_loss_kwargs = True  # fix transformers>=4.46.2
         if self.args.predict_with_generate:
             self.infer_engine = TransformersEngine(
                 self.model, template=self.template, max_batch_size=self.args.per_device_eval_batch_size)
         self.jsonl_writer = JsonlWriter(os.path.join(self.args.output_dir, 'predict.jsonl'))
+        self._mol_kl_iter = None
+        if self.ref_model is not None:
+            # Move/wrap the frozen reference model onto the accelerator device for inference,
+            # matching the conventions used by ms-swift RLHF trainers.
+            if getattr(self, 'is_deepspeed_enabled', False):
+                from swift.rlhf_trainers.utils import prepare_deepspeed
+                self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+            elif getattr(self, 'is_fsdp_enabled', False):
+                from swift.rlhf_trainers.utils import prepare_fsdp
+                self.ref_model = prepare_fsdp(self.ref_model, self.accelerator)
+            else:
+                self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+        if getattr(self.args, 'mol_kl_coef', 0.0) > 0 and self.mol_train_dataset is None:
+            logger.warning('`--mol_kl_coef` > 0 but no `--mol_dataset` provided; MoL KL term will be skipped.')
 
     @staticmethod
     def _predict_data_collator(batch):
@@ -221,8 +240,92 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
             # Liger does not have logits
             # Unsloth has a bug with output logits
             self._compute_acc(outputs, labels, cu_seqlens=cu_seqlens)
+
+        # MoL: add reverse/forward/jsd KL on a separate batch sampled from --mol_dataset.
+        if self._mol_kl_enabled():
+            kl_loss = self._compute_mol_kl_loss(model)
+            loss = loss + self.args.mol_kl_coef * kl_loss.to(loss.device)
+            mode = 'train' if self.model.training else 'eval'
+            self.custom_metrics[mode]['mol_kl_loss'].update(kl_loss.detach())
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, *args, **kwargs):
         with self.template.forward_context(self.model, inputs):
             return super().training_step(model, inputs, *args, **kwargs)
+
+    # ------------------------- MoL helpers -------------------------
+    def _mol_kl_enabled(self) -> bool:
+        return (getattr(self.args, 'mol_kl_coef', 0.0) > 0 and self.mol_train_dataset is not None
+                and self.model.training)
+
+    def _build_mol_kl_dataloader(self):
+        orig = self.train_dataset
+        self.train_dataset = self.mol_train_dataset
+        try:
+            return self.get_train_dataloader()
+        finally:
+            self.train_dataset = orig
+
+    def _next_mol_kl_batch(self):
+        if self._mol_kl_iter is None:
+            self._mol_kl_iter = iter(self._build_mol_kl_dataloader())
+        try:
+            return next(self._mol_kl_iter)
+        except StopIteration:
+            self._mol_kl_iter = iter(self._build_mol_kl_dataloader())
+            return next(self._mol_kl_iter)
+
+    def _mol_kl_divergence(self, student_logits: torch.Tensor, ref_logits: torch.Tensor,
+                           labels: torch.Tensor) -> torch.Tensor:
+        """Token-averaged KL between student and frozen reference at label (non -100) positions."""
+        kl_type = self.args.mol_kl_type
+        T = self.args.mol_kl_temperature
+        # Predict-next-token alignment.
+        student_logits = student_logits[..., :-1, :].float() / T
+        ref_logits = ref_logits[..., :-1, :].float() / T
+        shift_labels = labels[..., 1:]
+        mask = (shift_labels != -100)
+        log_p = F.log_softmax(student_logits, dim=-1)
+        log_q = F.log_softmax(ref_logits, dim=-1)
+        if kl_type == 'reverse':
+            kl = (log_p.exp() * (log_p - log_q)).sum(-1)
+        elif kl_type == 'forward':
+            kl = (log_q.exp() * (log_q - log_p)).sum(-1)
+        elif kl_type == 'jsd':
+            beta = self.args.mol_kl_jsd_beta
+            log_m = torch.logsumexp(
+                torch.stack([log_p + math.log(beta), log_q + math.log(1 - beta)], dim=0), dim=0)
+            kl_p = (log_p.exp() * (log_p - log_m)).sum(-1)
+            kl_q = (log_q.exp() * (log_q - log_m)).sum(-1)
+            kl = beta * kl_p + (1 - beta) * kl_q
+        else:
+            raise ValueError(f'Unknown mol_kl_type: {kl_type}')
+        kl = kl * (T * T)
+        denom = mask.sum().clamp(min=1)
+        return (kl * mask).sum() / denom
+
+    def _compute_mol_kl_loss(self, model) -> torch.Tensor:
+        inputs = self._next_mol_kl_batch()
+        # Move to device using the base HF prepare to avoid swift's logits_to_keep / aux_loss side effects.
+        inputs = HfSeq2SeqTrainer._prepare_inputs(self, inputs)
+        # Strip keys that should not be passed to model.forward; KL needs full logits.
+        for k in ('compute_loss_func', 'loss_scale', 'text_position_ids', 'channel', 'logits_to_keep'):
+            inputs.pop(k, None)
+        labels = inputs.pop('labels')
+        with self.template.forward_context(self.model, inputs):
+            student_out = model(**inputs)
+        if self.ref_model is not None:
+            with torch.no_grad(), self.template.forward_context(self.ref_model, inputs):
+                ref_out = self.ref_model(**inputs)
+            ref_logits = ref_out.logits
+        else:
+            unwrapped = self.accelerator.unwrap_model(model)
+            if not (is_peft_available() and isinstance(unwrapped, PeftModel)):
+                raise RuntimeError(
+                    'MoL requires either `--mol_ref_model`, full-parameter training '
+                    '(auto-snapshot reference), or a PEFT model so the frozen base can be reached '
+                    'via `disable_adapter`.')
+            with torch.no_grad(), unwrapped.disable_adapter(), self.template.forward_context(self.model, inputs):
+                ref_out = model(**inputs)
+            ref_logits = ref_out.logits
+        return self._mol_kl_divergence(student_out.logits, ref_logits, labels)

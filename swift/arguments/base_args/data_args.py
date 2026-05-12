@@ -76,6 +76,11 @@ class DataArguments:
     cached_val_dataset: List[str] = field(default_factory=list)
     split_dataset_ratio: float = 0.
 
+    # MoL (Mixture of Losses, arxiv 2505.12043): a separate dataset used for the KL term.
+    # When set together with `--mol_kl_coef > 0`, each training step samples one batch from `--dataset`
+    # for the CE loss and one batch from `--mol_dataset` for the KL-to-reference-model term.
+    mol_dataset: List[str] = field(default_factory=list)
+
     data_seed: int = 42
     dataset_num_proc: int = 1
     load_from_cache_file: bool = False
