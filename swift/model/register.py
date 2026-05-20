@@ -184,7 +184,10 @@ class ModelLoader(BaseModelLoader):
         self.attn_impl_keys = None
         experts_impl = experts_impl or kwargs.get('experts_implementation')
         if experts_impl is not None and not transformers_5:
-            raise ValueError('experts_impl is only supported in "transformers>=5.0".')
+            if experts_impl == 'eager':
+                experts_impl = None
+            else:
+                raise ValueError('experts_impl is only supported in "transformers>=5.0".')
         self.experts_impl = experts_impl
         self.rope_scaling = rope_scaling
         self.max_model_len = max_model_len
@@ -208,7 +211,6 @@ class ModelLoader(BaseModelLoader):
         else:
             model_kwargs['torch_dtype'] = self.torch_dtype
         _patch_awq_compat(model_info)
-        logger.info(f'model_kwargs: {model_kwargs}')
 
     def _postprocess_config(self, config):
         # fix prediction_step (internvl2, ovis, ...)
@@ -256,7 +258,8 @@ class ModelLoader(BaseModelLoader):
     def get_processor(self, model_dir: str, config: PretrainedConfig) -> Processor:
         auto_tokenizer_cls = self.auto_tokenizer_cls
         if auto_tokenizer_cls is None:
-            if os.path.exists(os.path.join(model_dir, 'preprocessor_config.json')):
+            if os.path.exists(os.path.join(model_dir, 'preprocessor_config.json')) or os.path.exists(
+                    os.path.join(model_dir, 'processor_config.json')):
                 from transformers import AutoProcessor
                 auto_tokenizer_cls = AutoProcessor
             else:
@@ -267,13 +270,16 @@ class ModelLoader(BaseModelLoader):
                   model_kwargs) -> PreTrainedModel:
         if self.experts_impl is not None:
             model_kwargs['experts_implementation'] = self.experts_impl
+        logger.info(f'model_kwargs: {model_kwargs}')
         model_info = self.model_info
         model_meta = self.model_meta
         auto_model_cls = self.auto_model_cls
         model = None
         if model_info.task_type in {'seq_cls', 'reranker'}:
             HfConfigFactory.set_config_attr(config, 'tie_word_embeddings', False)
-        if model_info.task_type in {'seq_cls', 'reranker'} and auto_model_cls is None and not self.return_dummy_model:
+        if model_info.task_type in {'seq_cls', 'reranker'} and auto_model_cls in {
+                None, AutoModelForSequenceClassification
+        } and not self.return_dummy_model:
             with patch_automodel_for_sequence_classification(model_config=config, patch_from_pretrained=False):
                 try:
                     model = AutoModelForSequenceClassification.from_pretrained(
@@ -406,6 +412,9 @@ class ModelLoader(BaseModelLoader):
             elif hf_model_type == 'qwen3_moe':
                 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
                 z3_leaf_modules = [Qwen3MoeSparseMoeBlock]
+            elif hf_model_type == 'gemma4':
+                from transformers.models.gemma4.modeling_gemma4 import Gemma4TextExperts
+                z3_leaf_modules = [Gemma4TextExperts]
             elif hf_model_type == 'glm4_moe':
                 from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeMoE
                 z3_leaf_modules = [Glm4MoeMoE]
@@ -442,8 +451,9 @@ class ModelLoader(BaseModelLoader):
     def _init_generation_config(self, model, model_dir):
         # generation_config
         generation_config_path = os.path.join(model_dir, 'generation_config.json')
-        if not hasattr(model, 'generation_config') and os.path.isfile(generation_config_path):
-            model.generation_config = GenerationConfig.from_pretrained(model_dir)
+        if getattr(model, 'generation_config', None) is None:
+            model.generation_config = GenerationConfig.from_pretrained(model_dir) if os.path.isfile(
+                generation_config_path) else None
         # fix llama2 warning
         if getattr(model, 'generation_config', None):
             fix_do_sample_warning(model.generation_config)

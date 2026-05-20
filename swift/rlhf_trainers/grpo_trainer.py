@@ -45,7 +45,6 @@ from transformers.trainer import Trainer as HfTrainer
 from trl import GRPOTrainer as HFGRPOTrainer
 from trl.models import prepare_deepspeed
 from trl.trainer import grpo_trainer
-from trl.trainer.callbacks import SyncRefModelCallback
 from trl.trainer.grpo_trainer import RepeatSampler, nanmax, nanmin
 from trl.trainer.utils import selective_log_softmax
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -60,7 +59,7 @@ from swift.utils import (JsonlWriter, get_cu_seqlens_from_position_ids, get_logg
                          is_wandb_available, remove_response, seed_worker, shutdown_event_loop_in_daemon,
                          start_event_loop_in_daemon, to_device, unwrap_model_for_generation)
 from .arguments import GRPOConfig
-from .rollout_mixin import DataType, RolloutTrainerMixin
+from .rollout_mixin import DataType, RolloutTrainerMixin, SyncRefModelCallback
 from .utils import (_ForwardRedirection, compute_chord_loss, get_even_process_data, identity_data_collator,
                     load_pil_img, make_chord_sft_dataset, nanstd, pad_logps_back_to_batch, patch_save_last_checkpoint,
                     profiling_context, profiling_decorator, replace_assistant_response_with_ids)
@@ -133,6 +132,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             infer_template = copy(self.template)
             infer_template.padding_free = False
             infer_template.sequence_parallel_size = 1
+            infer_template.remove_unused_columns = True
             self.engine = TransformersEngine(self.model, template=infer_template, max_batch_size=0)  # 0: no limit
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
@@ -141,7 +141,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         self.model_accepts_loss_kwargs = False
 
         if args.sync_ref_model:
-            self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
+            self.add_callback(SyncRefModelCallback(self))
 
         if self.args.dynamic_sample or self.template.truncation_strategy == 'raise':
             self._prepare_resample_data_iterator()
@@ -162,6 +162,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # `_get_train_sampler` and `_prepare_inputs`.
         self._buffered_inputs = None
         self._current_train_step_time = 0.0
+        self._filtered_keys = [
+            'prompt_id', 'request_id', 'response_token_ids', 'finish_reason', 'is_truncated', 'add_eos'
+        ]
 
     def _get_data_collator(self, args, template):
         return identity_data_collator
@@ -203,7 +206,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 generation_batch = self._generate_and_score_completions(generation_batch)
                 self._buffered_inputs = generation_batch  # < this is the change
             inputs = self._buffered_inputs[self._step % num_rollout_samples]
-            self._step += 1
         else:
             inputs = self._generate_and_score_completions(generation_batch)
         return inputs
@@ -772,78 +774,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
             return rewards_std
 
-    def split_by_mini_batches(self, inputs: DataType) -> List[DataType]:
-        """
-        Split inputs into mini-batches, handling variable generation counts.
-
-        When rollout count differs from expected (bs * spg * num_generations),
-        we need to adjust the splitting logic to maintain proper batch sizes.
-
-        This method divides the input data into chunks based on the steps per generation (spg).
-        If the total number of inputs is not evenly divisible by spg, the remainder is
-        distributed across the first few chunks to ensure all data is included.
-
-        Args:
-            inputs (DataType): List of input data samples to be split into mini-batches.
-
-        Returns:
-            List[DataType]: A list of data chunks, where each chunk represents one step
-                           in the generation process. The number of chunks equals spg.
-        """
-        # Slice to keep only the local part of the data
-        if self.template.sequence_parallel_size == 1:
-            mode: str = 'train' if self.model.training else 'eval'
-            spg: int = self.args.steps_per_generation if mode == 'train' else 1
-
-            chunk_size: int = len(inputs) // spg
-            remainder: int = len(inputs) % spg
-            spg_chunks: List[DataType] = []
-
-            start_idx: int = 0
-            for i in range(spg):
-                current_chunk_size: int = chunk_size + (1 if i < remainder else 0)
-                end_idx: int = start_idx + current_chunk_size
-                spg_chunks.append(inputs[start_idx:end_idx])
-                start_idx = end_idx
-
-            return spg_chunks
-        else:
-            """Split by mini batches for GRPO sequence parallel training"""
-            output = [None] * sequence_parallel.sp_world_size
-            # gather inputs within a sp group
-            dist.all_gather_object(output, inputs, group=sequence_parallel.sp_group)
-            if sequence_parallel.rp_world_size > 1:
-                output_rp = [None] * sequence_parallel.rp_world_size
-                output = [p for sublist in output for p in sublist]
-                dist.all_gather_object(output_rp, output, group=sequence_parallel.rp_group)
-                output = output_rp
-            output = [p for sublist in output for p in sublist]
-            inputs = output
-
-            mode = 'train' if self.model.training else 'eval'
-            spg = self.args.steps_per_generation * sequence_parallel.world_size if mode == 'train' else 1
-
-            if mode == 'eval':
-                # TODO only take the first bs rows, because eval does not support loop
-                bs = self.args.per_device_eval_batch_size
-                inputs = inputs[:bs]
-                spg = 1
-
-            # Use the new dynamic splitting logic
-            chunk_size: int = len(inputs) // spg
-            remainder: int = len(inputs) % spg
-            spg_chunks: List[DataType] = []
-
-            start_idx: int = 0
-            for i in range(spg):
-                current_chunk_size: int = chunk_size + (1 if i < remainder else 0)
-                end_idx: int = start_idx + current_chunk_size
-                spg_chunks.append(inputs[start_idx:end_idx])
-                start_idx = end_idx
-
-            spg_chunks = to_device(spg_chunks, device=self.accelerator.device)
-            return spg_chunks
-
     @contextmanager
     def null_ref_context(self):
         """Context manager for handling null reference model (that is, peft adapter manipulation)."""
@@ -880,6 +810,11 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                         data['messages'] = replace_assistant_response_with_ids(data['messages'],
                                                                                data['response_token_ids'], loss_mask)
                 batch_encoded_inputs = [template.encode(data, return_length=True) for data in batch]
+                for encoded_inputs in batch_encoded_inputs:
+                    extra_kwargs = encoded_inputs.get('_extra_kwargs') or {}
+                    for k in list(extra_kwargs.keys()):
+                        if k not in self._filtered_keys:
+                            extra_kwargs.pop(k)
                 batch_encoded_inputs = to_device(template.data_collator(batch_encoded_inputs), self.model.device)
                 if self.dynamic_num_samples and self.is_multimodal:
                     batch_encoded_inputs['_origin_data'] = batch
@@ -1090,6 +1025,55 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         self._update_metrics(metrics_data)
         return loss
 
+    def _compute_fipo_influence(self, log_ratio: torch.Tensor, coef_1: torch.Tensor, advantages: torch.Tensor,
+                                completion_mask: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute FIPO token-level influence weight from Future-KL divergence."""
+        future_kl_delta = log_ratio.masked_fill(~completion_mask, 0.0)
+
+        # Dual-Clip participation mask: high-ratio tokens do not contribute to Future-KL.
+        if self.args.delta is not None:
+            delta = torch.as_tensor(self.args.delta, dtype=log_ratio.dtype, device=log_ratio.device)
+            high_ratio_mask = coef_1 > delta
+            future_kl_delta = torch.where(high_ratio_mask, torch.zeros_like(future_kl_delta), future_kl_delta)
+
+        seq_len = future_kl_delta.shape[1]
+        future_kl = torch.zeros_like(future_kl_delta)
+        positions = torch.arange(seq_len, device=log_ratio.device).unsqueeze(1)
+        gamma = torch.as_tensor(self.fipo_gamma, dtype=log_ratio.dtype, device=log_ratio.device)
+        chunk_size = 128
+        for chunk_start in range(0, seq_len, chunk_size):
+            chunk_end = min(seq_len, chunk_start + chunk_size)
+            chunk_positions = torch.arange(chunk_start, chunk_end, device=log_ratio.device).unsqueeze(0)
+            distance = chunk_positions - positions
+            future_mask = distance >= 0
+            decay_block = torch.pow(gamma, distance.clamp(min=0)) * future_mask.to(log_ratio.dtype)
+            future_kl += torch.matmul(future_kl_delta[:, chunk_start:chunk_end], decay_block.t())
+        future_kl = future_kl.masked_fill(~completion_mask, 0.0)
+
+        influence_weight = torch.exp(future_kl)
+
+        if self.fipo_clip_range:
+            high = 1 + self.fipo_clip_range
+            low = 1.0 if self.fipo_clip_high_only else 1 - self.fipo_clip_range
+            influence_weight = torch.clamp(influence_weight, min=low, max=high)
+        influence_weight = influence_weight.detach()
+
+        # avoid amplifying negative-advantage tokens with very high IS ratios.
+        safety_mask = torch.ones_like(completion_mask, dtype=torch.bool)
+        if self.fipo_safety_threshold is not None:
+            negative_advantage = advantages.unsqueeze(1) < 0
+            high_is_ratio = coef_1 > self.fipo_safety_threshold
+            safety_mask = ~(negative_advantage & high_is_ratio)
+            influence_weight = torch.where(safety_mask, influence_weight,
+                                           torch.clamp(influence_weight, min=0.8, max=1.0))
+
+        metrics = {
+            'future_kl': future_kl,
+            'influence_weight': influence_weight,
+            'safety_mask': safety_mask,
+        }
+        return influence_weight, metrics
+
     def _compute_loss_and_metrics(self, model, inputs):
         """Core loss computation without metrics recording."""
         mode = 'train' if self.model.training else 'eval'
@@ -1132,8 +1116,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Only compute KL for loss if kl_in_reward=False (GRPO style)
         if self.beta != 0.0 and not self.kl_in_reward:
             ref_per_token_logps = inputs['ref_per_token_logps']
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1)
+            safe_ratio = torch.clamp(ref_per_token_logps - per_token_logps, min=-20, max=20)
+            per_token_kl = torch.clamp(torch.exp(safe_ratio) - safe_ratio - 1, min=-10, max=10)
         else:
             per_token_kl = None
 
@@ -1191,6 +1175,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         coef_1 = torch.exp(log_importance_weights)
 
+        fipo_metrics = None
         if self.loss_type == 'cispo':
             clamped_ratios = torch.clamp(coef_1, max=self.epsilon_high).detach()
             per_token_loss = -clamped_ratios * advantages.unsqueeze(1) * per_token_logps
@@ -1202,7 +1187,12 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             soft_gate = torch.where(is_positive, gate_pos, gate_neg)
 
             per_token_loss = -soft_gate * advantages_expanded
-        elif self.loss_type in ['grpo', 'bnpo', 'dr_grpo', 'dapo']:
+        elif self.loss_type == 'real':
+            per_token_loss = torch.zeros_like(per_token_logps)
+        elif self.loss_type in ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'fipo']:
+            if self.loss_type == 'fipo':
+                fipo_weight, fipo_metrics = self._compute_fipo_influence(log_ratio, coef_1, advantages, completion_mask)
+
             coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
             if self.args.delta is not None:
                 coef_1 = torch.clamp(coef_1, max=self.args.delta)
@@ -1210,6 +1200,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             per_token_loss1 = coef_1 * advantages.unsqueeze(1)
             per_token_loss2 = coef_2 * advantages.unsqueeze(1)
             per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+            if self.loss_type == 'fipo':
+                per_token_loss = per_token_loss * fipo_weight
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
         if per_token_kl is not None:
@@ -1240,8 +1232,41 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         elif self.loss_type == 'dr_grpo':
             batch_size = completion_mask.shape[0]
             loss = (per_token_loss * completion_mask).sum() / (batch_size * self.max_completion_length)
-        elif self.loss_type in ['cispo', 'dapo']:
-            # CISPO and DAPO: Normalize by total completion tokens across all processes
+        elif self.loss_type == 'real':
+            global_scores = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+
+            group_scores = global_scores.view(-1, self.num_generations)
+            group_rewards = advantages.view(-1, self.num_generations)
+
+            pos_mask = (group_rewards > 0)
+            neg_mask = (group_rewards <= 0)
+            valid_mask = (pos_mask.sum(dim=1) != 0) & (neg_mask.sum(dim=1) != 0)
+
+            if not valid_mask.any():
+                loss = torch.tensor(0., device=global_scores.device) * global_scores.mean()
+            else:
+                batch_scores = group_scores[valid_mask]
+                batch_pos_mask = pos_mask[valid_mask]
+                batch_neg_mask = neg_mask[valid_mask]
+
+                scaled_scores = batch_scores / self.real_tau
+                zeros = torch.zeros(batch_scores.size(0), 1, device=batch_scores.device, dtype=batch_scores.dtype)
+
+                # Negative Loss: log(1 + sum(e^{S_neg}))
+                neg_input = scaled_scores.masked_fill(~batch_neg_mask, float('-inf'))
+                neg_loss = torch.logsumexp(torch.cat([neg_input, zeros], dim=1), dim=1)
+
+                # Positive Loss: log(1 + sum(e^{-S_pos}))
+                pos_input = (-scaled_scores).masked_fill(~batch_pos_mask, float('-inf'))
+                pos_loss = torch.logsumexp(torch.cat([pos_input, zeros], dim=1), dim=1)
+
+                loss = (neg_loss + pos_loss).sum() / group_rewards.size(0)
+
+            if self.beta != 0.0:
+                kl_loss = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+                loss = loss + kl_loss * self.beta
+        elif self.loss_type in ['cispo', 'dapo', 'fipo']:
+            # CISPO, DAPO, and FIPO: Normalize by total completion tokens across all processes
             normalizer = inputs['num_items_in_batch'] / self.accelerator.num_processes
             loss = (per_token_loss * completion_mask).sum() / normalizer
         else:
@@ -1264,6 +1289,16 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             'completion_token_count': completion_token_count,
         }
 
+        if fipo_metrics is not None:
+            fipo_future_kl = masked_batch_mean(fipo_metrics['future_kl'])
+            fipo_influence_weight = masked_batch_mean(fipo_metrics['influence_weight'])
+            fipo_safety_keep = masked_batch_mean(fipo_metrics['safety_mask'].float())
+            metrics_data['fipo'] = {
+                'future_kl_mean': self.accelerator.gather_for_metrics(fipo_future_kl).nanmean().item(),
+                'influence_weight_mean': self.accelerator.gather_for_metrics(fipo_influence_weight).nanmean().item(),
+                'safety_keep_ratio': self.accelerator.gather_for_metrics(fipo_safety_keep).nanmean().item(),
+            }
+
         if per_token_kl is not None:
             mean_kl = masked_batch_mean(per_token_kl)
             metrics_data['kl'] = self.accelerator.gather_for_metrics(mean_kl).nanmean().item()
@@ -1279,7 +1314,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             cispo_clip_ratio = masked_batch_mean(is_cispo_clipped.float())
             gathered_cispo_clip_ratio = self.accelerator.gather_for_metrics(cispo_clip_ratio)
             metrics_data['clipping'] = {'cispo_clip_ratio': gathered_cispo_clip_ratio.nanmean().item()}
-        elif self.loss_type == 'sapo':
+        elif self.loss_type in ['sapo', 'real']:
             pass
         else:
             is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
@@ -1330,6 +1365,11 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             rollout_metrics = metrics_data['rollout_correction']
             for key, value in rollout_metrics.items():
                 self._metrics[mode][f'rollout_correction/{key}'].append(value)
+
+        # Update FIPO metrics
+        if 'fipo' in metrics_data:
+            for key, value in metrics_data['fipo'].items():
+                self._metrics[mode][f'fipo/{key}'].append(value)
 
         # Update clipping metrics
         if 'clipping' in metrics_data:
@@ -1412,6 +1452,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         clip_values = {'low': [], 'high': [], 'region': [], 'low_min': [], 'high_max': []}
         cispo_clip_values = []
         entropy_thresholds = []
+        fipo_values = {}
 
         for chunk_metrics, chunk_weight in all_metrics_data:
             chunk_tokens = chunk_metrics['completion_token_count']
@@ -1432,6 +1473,12 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # Collect KL metrics
             if 'kl' in chunk_metrics:
                 kl_values.append(chunk_metrics['kl'])
+
+            # Collect FIPO metrics (weighted by tokens)
+            if 'fipo' in chunk_metrics:
+                weight = chunk_tokens.item() if hasattr(chunk_tokens, 'item') else chunk_tokens
+                for key, value in chunk_metrics['fipo'].items():
+                    fipo_values.setdefault(key, []).append((value, weight))
 
             # Collect clipping metrics (weighted by tokens)
             if 'clipping' in chunk_metrics:
@@ -1481,6 +1528,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 'high_clip_max': max(clip_values['high_max']),
                 'region_clip_mean': weighted_avg(clip_values['region'])
             }
+
+        if fipo_values:
+            aggregated_metrics['fipo'] = {key: weighted_avg(values) for key, values in fipo_values.items()}
 
         # Update metrics
         self._update_metrics(aggregated_metrics)
@@ -1624,8 +1674,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Forward pass
         logits = model(**model_inputs).logits
 
-        # Extract relevant portion and apply temperature
-        logits = logits[:, -(logits_to_keep + 1):-1, :] / self.temperature
+        logits = logits[:, -(logits_to_keep + 1):-1, :]
+        logits.div_(self.temperature)
+
         input_ids_for_logps = input_ids[:, -logits_to_keep:]
 
         is_padding_free = self.template.padding_free
@@ -1935,8 +1986,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 'step': [str(self.state.global_step)] * seen_nums,
                 'prompt': list(self._logs['prompt'])[:seen_nums],
                 'completion': list(self._logs['completion'])[:seen_nums],
-                **{k: list(v)[:seen_nums]
-                   for k, v in self._logs['rewards'].items()},
+                **{
+                    k: list(v)[:seen_nums]
+                    for k, v in self._logs['rewards'].items()
+                },
                 'advantages': list(self._logs['advantages'])[:seen_nums],
             }
             for key, value in self._logs.items():
@@ -2092,20 +2145,35 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
     def get_chunked_inputs(self, inputs, start_idx, end_idx):
         chunk_inputs = {}
+        batch_size = inputs['seq_lengths'].shape[0] if self.template.padding_free else inputs['input_ids'].shape[0]
         # for LLM, slice the inputs
         for key, val in inputs.items():
             if isinstance(val, torch.Tensor):
-                chunk_inputs[key] = val if val.ndim == 0 else val[start_idx:end_idx]
+                if val.ndim == 0:
+                    chunk_inputs[key] = val
+                elif self.is_multimodal and val.shape[0] != batch_size:
+                    continue
+                else:
+                    chunk_inputs[key] = val[start_idx:end_idx]
+            elif isinstance(val, list) and len(val) == batch_size:
+                chunk_inputs[key] = val[start_idx:end_idx]
             else:
                 chunk_inputs[key] = val
         if self.is_multimodal:
             # for MLLM, re-encode to get mm-related inputs
             origin_data = inputs['_origin_data'][start_idx:end_idx]
             template = self.template
+            # prevent to be overwritten by data_collator
+            _preserved_chunk_keys = ('advantages', 'completion_mask', 'ref_per_token_logps', 'old_per_token_logps',
+                                     'rollout_per_token_logps', 'truncated_mask', 'rollout_is_weights', 'seq_lengths')
+            _preserved_dicts = {k: chunk_inputs.pop(k) for k in _preserved_chunk_keys if k in chunk_inputs}
+            current_length = inputs['input_ids'].shape[1]
             with self._template_context(template):
                 encoded_data = [template.encode(data) for data in origin_data]
-                chunk_inputs.update(to_device(template.data_collator(encoded_data), self.model.device))
+                chunk_inputs.update(
+                    to_device(template.data_collator(encoded_data, padding_to=current_length), self.model.device))
                 chunk_inputs.pop('labels', None)
+            chunk_inputs.update(_preserved_dicts)
         return chunk_inputs
 
     def _prepare_liger_loss(self):
@@ -2182,6 +2250,15 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # SAPO, https://arxiv.org/abs/2511.20347
         self.tau_pos = args.tau_pos
         self.tau_neg = args.tau_neg
+
+        # REAL, https://arxiv.org/abs/2602.05630
+        self.real_tau = args.real_tau
+
+        # FIPO, https://arxiv.org/abs/2603.19835
+        self.fipo_gamma = 2**(-1 / args.fipo_decay_rate)
+        self.fipo_clip_range = args.fipo_clip_range
+        self.fipo_clip_high_only = args.fipo_clip_high_only
+        self.fipo_safety_threshold = args.fipo_safety_threshold
 
         # RLOO,
         self.advantage_estimator = args.advantage_estimator
@@ -2506,7 +2583,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         # 2b. k3_kl: K3 estimator for KL(π_rollout || π_training)
         # More stable for small KL values
-        k3_kl_matrix = torch.exp(log_ratio) - log_ratio - 1
+        log_ratio_safe = torch.clamp(log_ratio, min=-20, max=20)
+        k3_kl_matrix = torch.clamp(torch.exp(log_ratio_safe) - log_ratio_safe - 1, min=-10, max=10)
         k3_kl = masked_mean(k3_kl_matrix, completion_mask)
         metrics['k3_kl'] = self.accelerator.gather_for_metrics(k3_kl).nanmean().item()
 
@@ -2626,8 +2704,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             k: v
             for k, v in inputs.items() if k not in [
                 'logits_to_keep', 'completion_mask', 'ref_per_token_logps', 'advantages', 'old_per_token_logps',
-                'truncated_mask', 'seq_lengths', 'num_items_in_batch', 'rollout_per_token_logps'
-            ]
+                'truncated_mask', 'seq_lengths', 'num_items_in_batch', 'rollout_per_token_logps', 'rollout_logprobs',
+                'rollout_is_weights'
+            ] + self._filtered_keys
         }
 
     def _get_eval_sampler(self, eval_dataset):

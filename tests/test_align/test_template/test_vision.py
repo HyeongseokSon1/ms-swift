@@ -920,6 +920,17 @@ def test_minicpmv4_5():
     assert response == response2
 
 
+def test_minicpmv4_6():
+    engine = TransformersEngine('OpenBMB/MiniCPM-V-4.6')
+    images = ['http://images.cocodataset.org/val2017/000000039769.jpg']
+    messages = [{'role': 'user', 'content': 'Please describe the image explicitly.'}]
+    engine.template.enable_thinking = False
+    response = _infer_model(engine, messages=messages, images=images)
+    engine.template.template_backend = 'jinja'
+    response2 = _infer_model(engine, messages=messages, images=images)
+    assert response == response2
+
+
 def _run_qwen3_vl_hf(messages, model, processor):
     from qwen_vl_utils import process_vision_info
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -1227,6 +1238,28 @@ def test_glm_ocr():
                         'ui功能了。')
 
 
+def test_gemma4():
+    engine = TransformersEngine('google/gemma-4-E2B-it')
+    images = ['http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/cat.png']
+    messages = [{
+        'role': 'user',
+        'content': 'What is shown in this image?',
+    }]
+    response = _infer_model(engine, messages=messages, images=images)
+    print(response)
+
+
+def test_mineru2_5_pro():
+    engine = TransformersEngine('OpenDataLab/MinerU2.5-Pro-2604-1.2B')
+    images = ['http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/ocr.png']
+    messages = [{
+        'role': 'user',
+        'content': '<image>\nText Recognition:',
+    }]
+    response = _infer_model(engine, messages=messages, images=images)
+    print(response)
+
+
 if __name__ == '__main__':
     from swift.infer_engine import RequestConfig, TransformersEngine
     from swift.utils import get_logger, seed_everything
@@ -1293,6 +1326,7 @@ if __name__ == '__main__':
     # test_interns1()
     # test_internvl3_5()
     # test_minicpmv4_5()
+    test_minicpmv4_6()
     # test_qwen3_vl()
     # test_keye_vl_1_5()
     # test_internvl3_hf()
@@ -1313,4 +1347,6 @@ if __name__ == '__main__':
     # test_deepseek_ocr_2()
     # test_step3_vl()
     # test_paddle_ocr_1_5()
-    test_glm_ocr()
+    # test_glm_ocr()
+    # test_gemma4()
+    # test_mineru2_5_pro()
