@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 import os
+import shutil
 from dataclasses import dataclass, field, fields
 from packaging import version
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -8,7 +9,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 import swift
 from swift.hub import get_hub
 from swift.model import get_ckpt_dir, get_model_processor, load_by_unsloth
-from swift.ray import RayArguments
+from swift.ray_utils import RayArguments
 from swift.template import Template, get_template
 from swift.tuner_plugin import tuners_map
 from swift.utils import (Processor, check_json_format, get_dist_setting, get_logger, import_external_file, is_dist,
@@ -49,6 +50,7 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
         model_kwargs (Optional[str]): Additional keyword arguments for specific models, passed as a JSON string
             (e.g., '{"key": "value"}'). It's recommended to use the same arguments for inference as for training.
             Default is None.
+        enable_npu_model_patch (bool): Whether to enable model-related NPU patches. Default is True.
         load_args (bool): Whether to load `args.json` from a checkpoint when using `--resume_from_checkpoint`,
             `--model`, or `--adapters`. Defaults to True for inference/export and False for training. Usually,
             this does not need to be modified. Default is True.
@@ -77,6 +79,7 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
 
     seed: int = 42
     model_kwargs: Optional[Union[dict, str]] = None
+    enable_npu_model_patch: bool = True
     load_args: bool = True
     load_data_args: bool = False
     # dataset
@@ -284,6 +287,9 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
             logger.info(f'The {self.__class__.__name__} will be saved in: {fpath}')
             with open(fpath, 'w', encoding='utf-8') as f:
                 json.dump(check_json_format(self.__dict__), f, ensure_ascii=False, indent=2)
+            config_file = os.getenv('SWIFT_CONFIG_FILE')
+            if config_file:
+                shutil.copy(config_file, output_dir)
 
     def _init_device(self):
         if is_dist():

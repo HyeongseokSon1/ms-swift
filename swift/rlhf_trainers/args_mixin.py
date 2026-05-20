@@ -98,19 +98,20 @@ class VllmArguments:
 
 @dataclass
 class RolloutTrainerArgumentsMixin(VllmArguments):
-    """A dataclass for configuring parameters required for GRPO training rollout.
+    """A dataclass for configuring parameters required for rollout-based training (GRPO, GKD, etc.).
 
     This mixin provides arguments for controlling the generation process during rollout, especially when using vLLM as
     the inference backend for generation.
 
     Args:
-        top_k (int): The number of highest probability vocabulary tokens to keep for top-k-filtering. Defaults to 50.
+        top_k (int): The number of highest probability vocabulary tokens to keep for top-k-filtering. -1 means
+            no filtering. Defaults to -1.
         top_p (float): If set to a float < 1, only the smallest set of most probable tokens with probabilities that
-            add up to top_p or higher are kept for generation. Defaults to 0.9.
+            add up to top_p or higher are kept for generation. Defaults to 1.0.
         repetition_penalty (float): The parameter for repetition penalty. 1.0 means no penalty. Defaults to 1.0.
         stop_words (List[str]): A list of strings that will stop the generation when they are generated. Defaults to an
             empty list.
-        use_vllm (bool): Whether to use vLLM as the inference backend for GRPO generation. Defaults to False.
+        use_vllm (bool): Whether to use vLLM as the inference backend for generation. Defaults to False.
         vllm_mode (Literal['server', 'colocate']): The vLLM integration mode. 'server' mode uses a vLLM server launched
             by swift rollout for sampling. 'colocate' mode deploys vLLM within the same process. For full-parameter
             training in 'server' mode, the environment variable `SWIFT_UPDATE_WEIGHTS_BUCKET_SIZE` can be set to
@@ -148,10 +149,16 @@ class RolloutTrainerArgumentsMixin(VllmArguments):
             decoding). When set, the model's generation is constrained to match the specified regex pattern. This is
             useful for tasks requiring structured outputs like reasoning chains. Defaults to None (disabled).
             Only effective when using vLLM backend (`use_vllm=True`).
+        generation_batch_size (Optional[int]): The total number of samples generated in one vLLM inference call.
+            It should be a multiple of `num_processes * per_device_train_batch_size`. Defaults to
+            `per_device_train_batch_size * gradient_accumulation_steps * num_processes`.
+        steps_per_generation (Optional[int]): The number of training steps (micro-batches) that reuse the same
+            set of generated samples. Only one of `steps_per_generation` and `generation_batch_size` should be set.
+            Defaults to `gradient_accumulation_steps`.
     """
     # generation args
-    top_k: int = 50
-    top_p: float = 0.9
+    top_k: int = -1
+    top_p: float = 1.0
     repetition_penalty: float = 1.
     stop_words: List[str] = field(default_factory=list)
 
@@ -181,6 +188,53 @@ class RolloutTrainerArgumentsMixin(VllmArguments):
     offload_model: bool = False
 
     wandb_log_unique_prompts: Optional[bool] = None
+
+    generation_batch_size: Optional[int] = None
+    steps_per_generation: Optional[int] = None
+
+    def _init_generation_batch_params(self):
+        num_generations = getattr(self, 'num_generations', 1)
+        num_processes = self.world_size
+        global_batch_size = self.per_device_train_batch_size * num_processes
+
+        if self.generation_batch_size is None and self.steps_per_generation is None:
+            self.steps_per_generation = self.gradient_accumulation_steps
+            self.generation_batch_size = global_batch_size * self.steps_per_generation
+        elif self.generation_batch_size is not None and self.steps_per_generation is None:
+            if self.generation_batch_size % global_batch_size != 0:
+                raise ValueError(f'generation_batch_size ({self.generation_batch_size}) must be divisible by '
+                                 f'the global batch size ({global_batch_size}).')
+            self.steps_per_generation = self.generation_batch_size // global_batch_size
+        elif self.generation_batch_size is None and self.steps_per_generation is not None:
+            self.generation_batch_size = global_batch_size * self.steps_per_generation
+        else:
+            expected = global_batch_size * self.steps_per_generation
+            if self.generation_batch_size != expected:
+                raise ValueError(f'generation_batch_size ({self.generation_batch_size}) must equal '
+                                 f'per_device_train_batch_size * world_size * steps_per_generation = {expected}.')
+
+        if self.steps_per_generation <= 0:
+            raise ValueError(f'steps_per_generation must be > 0, got {self.steps_per_generation}.')
+
+        if num_generations > 1:
+            if self.generation_batch_size % num_generations != 0:
+                possible_values = [
+                    n for n in range(2, self.generation_batch_size + 1) if self.generation_batch_size % n == 0
+                ]
+                raise ValueError(f'generation_batch_size ({self.generation_batch_size}) must be evenly divisible by '
+                                 f'num_generations ({num_generations}). Valid values: {possible_values}.')
+
+            if hasattr(self, 'eval_strategy') and self.eval_strategy != 'no':
+                num_generations_eval = getattr(self, 'num_generations_eval', None) or num_generations
+                global_eval_batch_size = self.per_device_eval_batch_size * num_processes
+                if global_eval_batch_size % num_generations_eval != 0:
+                    possible_values = [
+                        n for n in range(1, global_eval_batch_size + 1) if global_eval_batch_size % n == 0
+                    ]
+                    raise ValueError(
+                        f'The global eval batch size ({num_processes} x {self.per_device_eval_batch_size}) must be '
+                        f'evenly divisible by num_generations_eval ({num_generations_eval}). '
+                        f'Valid values: {possible_values}.')
 
 
 @dataclass
@@ -266,6 +320,16 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
         tau_neg (float): The temperature parameter for negative dominance in the SAPO algorithm, controlling the
             sharpness of the soft gating function. Typically, `tau_neg` is set > `tau_pos` to impose stronger
             constraints on negative dominance. The default value is 1.05.
+        real_tau (float): The temperature parameter. REAL induces monotonic and bounded gradient weighting with
+            magnitude upper-bounded by 1/tau. The default value is 0.5.
+        fipo_decay_rate (float): Half-life used to derive `fipo_gamma`. Defaults to 32.0.
+        fipo_clip_range (Optional[float]): Clip range for the FIPO influence weight. `0.2` clips to
+            `[0.8, 1.2]`; `None` or `0` disables clipping. Defaults to 0.2.
+        fipo_clip_high_only (bool): If `True`, clips the FIPO influence weight to `[1, 1 + fipo_clip_range]`.
+            Defaults to True.
+        fipo_safety_threshold (Optional[float]): Safety threshold for negative advantages. Tokens with
+            `advantage < 0` and importance ratio above this value have their FIPO influence weight capped to
+            `[0.8, 1.0]` to avoid over-penalization. Defaults to 4.0.
         advantage_estimator (Literal['grpo', 'rloo', 'reinforce_plus_plus']): The advantage estimation
             function to use. 'grpo' calculates the relative advantage within a group. Options are 'grpo', 'rloo',
             'reinforce_plus_plus'. Defaults to 'grpo'.
@@ -273,12 +337,6 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
             `False`, it's an independent term in the loss function. If `True`, KL is directly incorporated into the
             reward (subtracted from it). The default is tied to `advantage_estimator`: `False` for 'grpo', `True` for
             'rloo' and 'reinforce_plus_plus'.
-        generation_batch_size (Optional[int]): The batch size for sampling completions. It should be a
-            multiple of `num_processes * per_device_train_batch_size`. Defaults to `per_device_batch_size *
-            gradient_accumulation_steps * num_processes`.
-        steps_per_generation (Optional[int]): The number of optimization steps per generation round. Only
-            one of `steps_per_generation` and `generation_batch_size` can be set. Defaults to
-            `gradient_accumulation_steps`.
         num_generations_eval (Optional[int]): Number of generations to sample during evaluation. This allows
             using fewer generations during evaluation to save computation. If `None`, uses the value of
             `num_generations`. Defaults to None.
@@ -361,8 +419,15 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     # If false, add KL into loss, otherwise add into reward
     kl_in_reward: Optional[bool] = None  # rloo/reinforce_plus_plus: true, grpo: false (default)
 
-    generation_batch_size: Optional[int] = None
-    steps_per_generation: Optional[int] = None
+    # REAL https://arxiv.org/abs/2602.05630
+    real_tau: float = 0.5
+
+    # FIPO https://arxiv.org/abs/2603.19835
+    fipo_decay_rate: float = 32.0
+    fipo_clip_range: Optional[float] = 0.2
+    fipo_clip_high_only: bool = True
+    fipo_safety_threshold: Optional[float] = 4.0
+
     num_generations_eval: Optional[int] = None
 
     # dataset
