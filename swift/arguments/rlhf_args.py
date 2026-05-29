@@ -553,7 +553,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
     def _check_sequence_parallel(self):
         if self.sequence_parallel_size > 1:
-            supported_types = ['grpo', 'dpo']
+            supported_types = ['grpo', 'dpo', 'sdft']
             if self.rlhf_type not in supported_types:
                 raise NotImplementedError(
                     f"The current rlhf_type '{self.rlhf_type}' does not support sequence_parallel. "
@@ -662,6 +662,28 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
         if not (0 <= self.ema_decay < 1):
             raise ValueError(f'ema_decay must be in [0, 1), got {self.ema_decay}')
+
+        if self.sequence_parallel_size > 1:
+            # SDFT sequence parallel currently supports a specific, well-defined configuration.
+            # See `SDFTTrainer._compute_loss_sp` for the implementation details.
+            if not self.padding_free:
+                raise ValueError(
+                    'SDFT with sequence_parallel_size > 1 currently requires padding_free=true.')
+            if not self.use_vllm:
+                raise ValueError(
+                    'SDFT with sequence_parallel_size > 1 requires on-policy generation via vLLM '
+                    '(use_vllm=true). Non-vLLM generation does not support padding_free, which '
+                    'sequence parallel relies on.')
+            if self.sdft_alpha not in (0, 1):
+                raise NotImplementedError(
+                    'SDFT with sequence_parallel_size > 1 currently supports sdft_alpha in {0, 1} '
+                    '(pure forward/reverse KL) only.')
+            if self.ema_decay <= 0:
+                raise NotImplementedError(
+                    'SDFT with sequence_parallel_size > 1 requires ema_decay > 0 (EMA teacher path).')
+            if self.sft_alpha > 0:
+                raise NotImplementedError(
+                    'SDFT with sequence_parallel_size > 1 does not support sft_alpha > 0 yet.')
 
         # Self-distillation: no separate teacher
         self._teacher_use_disable_adapter = False
