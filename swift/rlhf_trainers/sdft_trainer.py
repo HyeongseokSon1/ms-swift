@@ -10,6 +10,7 @@ from typing import Optional, Union
 import torch.nn as nn
 from transformers import PreTrainedModel
 
+from swift.sequence_parallel import GatherLoss, sequence_parallel
 from swift.trainers import disable_gradient_checkpointing
 from swift.utils import get_logger
 from .gkd_trainer import DataSource, GKDTrainer
@@ -47,6 +48,14 @@ class SDFTTrainer(GKDTrainer):
 
         self.sdft_alpha = getattr(args, 'sdft_alpha', 1.0)
         self.sdft_demo_prefix = getattr(args, 'sdft_demo_prefix', 'Reference answer: ')
+
+        if self.template.sequence_parallel_size > 1:
+            # Each rank in an SP group only contributes the gradient of its local sequence slice; the
+            # framework averages gradients across the whole process group. Scaling gradient accumulation
+            # by the SP world size compensates for this (mirrors GRPO). The matching loss-side correction
+            # is handled by `GatherLoss` (it multiplies the backward gradient by `world_size`).
+            self.args.gradient_accumulation_steps = (
+                self.args.gradient_accumulation_steps * sequence_parallel.world_size)
 
         ema_status = f'decay={self.ema_decay}' if self.ema_decay > 0 else 'disabled (self-distillation)'
         logger.info(f'SDFT initialized with sdft_alpha={self.sdft_alpha} '
@@ -103,7 +112,28 @@ class SDFTTrainer(GKDTrainer):
             for name, param in unwrapped.named_parameters():
                 self._set_param_data(param, student_params[name])
 
+    def _get_train_sampler(self, train_dataset=None):
+        if self.template.sequence_parallel_size > 1:
+            # Hold each generation batch for `steps_per_generation * world_size` steps so the buffered,
+            # SP-gathered chunks are fully consumed before regenerating (see `GKDTrainer._prepare_inputs`).
+            from trl.trainer.utils import RepeatSampler
+            return RepeatSampler(
+                data_source=train_dataset or self.train_dataset,
+                mini_repeat_count=1,
+                batch_size=self.args.generation_batch_size,
+                repeat_count=self.args.steps_per_generation * sequence_parallel.world_size,
+                shuffle=getattr(self, 'shuffle_dataset', True),
+                seed=self.args.seed,
+            )
+        return super()._get_train_sampler(train_dataset)
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if self.template.sequence_parallel_size > 1:
+            loss = self._compute_loss_sp(model, inputs)
+            if return_outputs:
+                return (loss, None)
+            return loss
+
         if self.ema_decay <= 0 or self._ema_params is None:
             # EMA disabled or not yet initialized: use parent's compute_loss
             return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
@@ -274,3 +304,142 @@ class SDFTTrainer(GKDTrainer):
             loss = (alpha_t * kl_teacher + (1 - alpha_t) * kl_student) / num_valid
 
         return loss
+
+    # ------------------------------------------------------------------
+    # Sequence parallel (Ulysses) support
+    # ------------------------------------------------------------------
+    def _compute_loss_sp(self, model, inputs):
+        """SDFT loss under sequence parallel (Ulysses, padding_free).
+
+        The student sequence and the (demonstration-conditioned) teacher sequence have different
+        lengths, so they are split independently across the SP group. We:
+          1. Forward the EMA teacher under SP and gather its response-token distributions to every
+             rank, in global response order (no grad).
+          2. Forward the student under SP, keeping only the local logits slice (grad).
+          3. Compute the per-token KL for the student response tokens this rank owns, against the
+             aligned teacher distributions, then reduce with ``GatherLoss`` (which gathers the
+             per-token loss across the SP group and applies the correct gradient scaling).
+
+        Only ``sdft_alpha`` in {0, 1} (forward / reverse KL) is supported here; this is enforced in
+        ``RLHFArguments._check_sdft``.
+        """
+        if sequence_parallel.rp_world_size > 1:
+            raise NotImplementedError(
+                'SDFT sequence parallel currently supports Ulysses only (ring attention / '
+                'rp_world_size > 1 is not supported). This usually means num_attention_heads is not '
+                'divisible by sequence_parallel_size.')
+
+        data_source = inputs.pop('_data_source', DataSource.DATASET)
+        inputs.pop('_teacher_api_logprobs', None)
+        inputs.pop('_teacher_api_indices', None)
+        inputs.pop('_opsd_teacher_messages', None)
+        opsd_teacher_inputs = inputs.pop('_opsd_teacher_inputs', None)
+        # data_source is unused under SP (sft_alpha > 0 is disallowed), kept for parity/readability.
+        del data_source
+
+        student_labels = inputs['labels']
+        model_inputs = {k: v for k, v in inputs.items() if k not in {'prompt', 'labels'}}
+
+        # --- Teacher forward (EMA weights, no grad) -> gathered response distributions ---
+        if opsd_teacher_inputs is not None:
+            teacher_inputs = {k: v for k, v in model_inputs.items()}
+            teacher_inputs.update({k: v for k, v in opsd_teacher_inputs.items() if k != 'labels'})
+            teacher_labels = opsd_teacher_inputs['labels']
+        else:
+            teacher_inputs = {k: v for k, v in model_inputs.items()}
+            teacher_labels = student_labels
+
+        with torch.no_grad(), self._ema_weight_context(), \
+                disable_gradient_checkpointing(model, self.args.gradient_checkpointing_kwargs):
+            teacher_resp_logits = self._sp_response_logits(model, teacher_inputs, teacher_labels)
+
+        # --- Student forward (current weights, grad) ---
+        student_sp_inputs = {k: v for k, v in model_inputs.items()}
+        student_sp_inputs['labels'] = student_labels
+        sequence_parallel.prepare_inputs(student_sp_inputs)
+        student_pos_ids = sequence_parallel.real_position_ids
+        local_labels = student_sp_inputs.pop('labels')  # padded + shifted + split: [1, s_local]
+        student_logits = model(**student_sp_inputs).logits  # [1, s_local, V]
+
+        local_mask = local_labels != -100  # [1, s_local]
+        n_local = int(local_mask.sum().item())
+
+        # Align local student response tokens to the global response order used by `teacher_resp_logits`.
+        # Reproduce the exact pad-then-shift order that `pad_and_split_inputs` uses for labels, so that
+        # the per-rank contiguous split matches `local_labels` token-for-token.
+        full_shifted = sequence_parallel.pad(student_labels, padding_value=-100, position_ids=student_pos_ids)
+        full_shifted = torch.roll(full_shifted, shifts=-1, dims=-1)
+        full_mask = (full_shifted != -100)[0]  # [S_s_pad]
+        total_seq = full_mask.shape[0]
+        chunk = total_seq // sequence_parallel.world_size
+        my_start = sequence_parallel.sp_rank * chunk
+        offset = int(full_mask[:my_start].sum().item())
+        num_resp = int(full_mask.sum().item())
+
+        assert teacher_resp_logits.shape[0] == num_resp, (
+            f'SDFT SP response-token count mismatch: teacher={teacher_resp_logits.shape[0]}, '
+            f'student={num_resp}. Student and teacher must share the same response tokens.')
+
+        # Per-token KL for the response tokens owned by this rank, laid back into a [1, s_local] tensor.
+        # Seed from `student_logits.sum(-1) * 0` (zeros) so the tensor stays connected to the autograd
+        # graph even on ranks whose local slice holds no response tokens (n_local == 0); otherwise the
+        # backward pass through GatherLoss would have nothing to scatter on those ranks.
+        per_token = student_logits.sum(dim=-1).mul(0.0)  # [1, s_local], grad-connected zeros
+        if n_local > 0:
+            student_resp = student_logits[local_mask]  # [n_local, V]
+            teacher_resp = teacher_resp_logits[offset:offset + n_local]  # [n_local, V]
+            kl = self._sdft_kl_per_token(student_resp, teacher_resp)  # [n_local]
+            per_token = per_token.clone()
+            per_token[local_mask] = kl.to(per_token.dtype)
+
+        # Gather the per-token loss across the SP group (GatherLoss handles gradient scaling), then
+        # normalize by the global number of response tokens to recover the batchmean reduction.
+        gathered, _ = GatherLoss.apply(per_token, local_labels, 1, student_pos_ids)
+        loss = gathered.sum() / max(num_resp, 1)
+        return loss
+
+    def _sp_response_logits(self, model, fwd_inputs, full_labels):
+        """Forward `fwd_inputs` under SP and return response-token logits gathered to full sequence
+        order, shape [N, V]. Used for the (no-grad) teacher pass."""
+        prep = {k: v for k, v in fwd_inputs.items() if k != 'labels'}
+        prep['labels'] = full_labels
+        sequence_parallel.prepare_inputs(prep)
+        pos_ids = sequence_parallel.real_position_ids
+        prep.pop('labels', None)
+        local_logits = model(**prep).logits  # [1, t_local, V]
+        full_logits = sequence_parallel.gather(local_logits, dim=1, position_ids=pos_ids)  # [1, S_t_pad, V]
+
+        shifted = sequence_parallel.pad(full_labels, padding_value=-100, position_ids=pos_ids)
+        shifted = torch.roll(shifted, shifts=-1, dims=-1)
+        mask = shifted != -100  # [1, S_t_pad]
+        return full_logits[mask]  # [N, V]
+
+    def _sdft_kl_per_token(self, student_logits, teacher_logits):
+        """Per-token KL divergence (summed over vocab) for sdft_alpha in {0, 1}.
+
+        Returns a 1-D tensor of shape [num_tokens]. The outer caller divides the gathered sum by the
+        global response-token count, which reproduces the ``batchmean`` reduction of ``_sdft_kl_loss``.
+        """
+        student_logits = student_logits / self.temperature
+        teacher_logits = teacher_logits / self.temperature
+
+        # Handle vocab size mismatch (defensive; student == teacher model, so normally identical).
+        stu_dim = student_logits.shape[-1]
+        tea_dim = teacher_logits.shape[-1]
+        if stu_dim != tea_dim:
+            max_dim = max(stu_dim, tea_dim)
+            if stu_dim < max_dim:
+                student_logits = F.pad(student_logits, (0, max_dim - stu_dim), value=float('-inf'))
+            if tea_dim < max_dim:
+                teacher_logits = F.pad(teacher_logits, (0, max_dim - tea_dim), value=float('-inf'))
+
+        s_log_probs = F.log_softmax(student_logits, dim=-1)
+        t_log_probs = F.log_softmax(teacher_logits, dim=-1)
+
+        if self.sdft_alpha == 0:
+            # Forward KL: KL(Teacher || Student)
+            kl = F.kl_div(s_log_probs, t_log_probs, reduction='none', log_target=True)
+        else:
+            # Reverse KL: KL(Student || Teacher)  (sdft_alpha == 1)
+            kl = F.kl_div(t_log_probs, s_log_probs, reduction='none', log_target=True)
+        return kl.sum(dim=-1)
