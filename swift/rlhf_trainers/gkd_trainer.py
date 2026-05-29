@@ -643,6 +643,12 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
         model = self.model
         steps_per_generation = self.args.steps_per_generation
+        if self.template.sequence_parallel_size > 1:
+            # Under sequence parallel, `split_by_mini_batches` gathers inputs across the SP group and
+            # produces `steps_per_generation * sequence_parallel.world_size` chunks. Keep the buffering
+            # index in sync so each step consumes the correct chunk (mirrors GRPO's num_rollout_samples).
+            from swift.sequence_parallel import sequence_parallel
+            steps_per_generation = steps_per_generation * sequence_parallel.world_size
 
         if self._step % steps_per_generation == 0 or self._buffered_inputs is None:
             if self._get_random_num() <= self.lmbda:
