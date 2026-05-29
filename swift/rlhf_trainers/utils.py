@@ -4,6 +4,7 @@ import functools
 import ipaddress
 import math
 import os
+import re
 import socket
 import time
 import torch
@@ -22,12 +23,13 @@ from pydantic import BaseModel, field_validator
 from torch import nn
 from torch.utils.data import DataLoader, RandomSampler
 from types import MethodType
-from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar, Union
 
 from swift.template import Messages
 from swift.tuners.lora import LoraConfig
-from swift.utils import (gc_collect, get_cu_seqlens_from_position_ids, get_logger, get_torch_device,
-                         is_swanlab_available, is_vllm_available, is_wandb_available, synchronize, to_device)
+from swift.utils import (gc_collect, get_cu_seqlens_from_position_ids, get_logger, get_packed_seq_params,
+                         get_torch_device, is_swanlab_available, is_vllm_available, is_wandb_available, synchronize,
+                         to_device)
 
 if is_wandb_available():
     import wandb
@@ -37,6 +39,11 @@ if is_swanlab_available():
 T = TypeVar('T')
 
 _ipv6_patch_applied = False
+
+# Constants for the RL training LoRA adapter identity.
+VLLM_LORA_INT_ID = 111
+VLLM_LORA_NAME = 'swift_lora'
+VLLM_LORA_PATH = 'swift_dummy_lora_path'
 
 if is_vllm_available():
     from vllm.lora.request import LoRARequest
@@ -136,8 +143,11 @@ def patch_stateless_process_group_for_ipv6():
     if not is_vllm_available():
         return
 
-    from torch.distributed import TCPStore
+    import inspect
     from vllm.distributed.utils import StatelessProcessGroup
+
+    # vLLM >= 0.19.0: create() accepts listen_socket and handles TCPStore internally
+    _has_listen_socket_param = 'listen_socket' in inspect.signature(StatelessProcessGroup.create).parameters
 
     # Save original method for fallback
     _original_create = StatelessProcessGroup.create
@@ -150,6 +160,7 @@ def patch_stateless_process_group_for_ipv6():
         world_size: int,
         data_expiration_seconds: int = 3600,
         store_timeout: int = 300,
+        **kwargs,
     ) -> StatelessProcessGroup:
         """Patched version of StatelessProcessGroup.create that supports IPv6.
 
@@ -164,37 +175,53 @@ def patch_stateless_process_group_for_ipv6():
                 world_size=world_size,
                 data_expiration_seconds=data_expiration_seconds,
                 store_timeout=store_timeout,
+                **kwargs,
             )
 
-        # IPv6 path
+        # IPv6 path: create an AF_INET6 socket
         launch_server = rank == 0
         if launch_server:
             listen_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
             listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listen_socket.bind((host, port))
             listen_socket.listen()
-            listen_fd = listen_socket.fileno()
         else:
             listen_socket = None
-            listen_fd = None
 
-        store = TCPStore(
-            host_name=host,
-            port=port,
-            world_size=world_size,
-            is_master=launch_server,
-            timeout=timedelta(seconds=store_timeout),
-            use_libuv=False,
-            master_listen_fd=listen_fd,
-        )
-
-        return StatelessProcessGroup(
-            rank=rank,
-            world_size=world_size,
-            store=store,
-            socket=listen_socket,
-            data_expiration_seconds=data_expiration_seconds,
-        )
+        if _has_listen_socket_param:
+            # vLLM >= 0.19.0: pass listen_socket to create(), which handles
+            # TCPStore creation and returns StatelessProcessGroup without socket field
+            kwargs.pop('listen_socket', None)
+            return _original_create(
+                host=host,
+                port=port,
+                rank=rank,
+                world_size=world_size,
+                data_expiration_seconds=data_expiration_seconds,
+                store_timeout=store_timeout,
+                listen_socket=listen_socket,
+                **kwargs,
+            )
+        else:
+            # vLLM < 0.19.0: manually create TCPStore and pass socket to constructor
+            from torch.distributed import TCPStore
+            listen_fd = listen_socket.fileno() if listen_socket else None
+            store = TCPStore(
+                host_name=host,
+                port=port,
+                world_size=world_size,
+                is_master=launch_server,
+                timeout=timedelta(seconds=store_timeout),
+                use_libuv=False,
+                master_listen_fd=listen_fd,
+            )
+            return StatelessProcessGroup(
+                rank=rank,
+                world_size=world_size,
+                store=store,
+                socket=listen_socket,
+                data_expiration_seconds=data_expiration_seconds,
+            )
 
     # Apply the monkey patch to vLLM
     StatelessProcessGroup.create = _patched_stateless_pg_create
@@ -852,25 +879,17 @@ def prepare_fsdp(model, accelerator, evaluation_mode: bool = True):
     return model
 
 
-def patch_vllm_moe_model_weight_loader(model):
-    """
-    Patch vLLM MoE model to add weight_loader attribute to expert weights.
+_moe_model_registry_cache = None
 
-    This is a workaround for a bug in vLLM 0.8.2 where MoE weights (w13_weight, w2_weight)
-    don't have the weight_loader attribute, causing AttributeError during weight loading.
-    Code adapted from verl/verl/utils/vllm/patch.py
 
-    Args:
-        model: The vLLM model to patch.
-    """
+def _get_moe_model_registry():
+
+    global _moe_model_registry_cache
+    if _moe_model_registry_cache is not None:
+        return _moe_model_registry_cache
+
     import importlib
 
-    # Check if already patched (idempotent)
-    if getattr(model, '_swift_moe_weight_loader_patched', False):
-        return
-
-    # MoE model configurations: (module_path, class_names, mlp_attr)
-    # mlp_attr specifies the attribute name for the MoE layer in each model
     moe_model_configs = [
         ('vllm.model_executor.models.deepseek_v2', ('DeepseekV2ForCausalLM', 'DeepseekV3ForCausalLM'), 'mlp'),
         ('vllm.model_executor.models.mixtral', ('MixtralForCausalLM', ), 'block_sparse_moe'),
@@ -881,7 +900,6 @@ def patch_vllm_moe_model_weight_loader(model):
         ('vllm.model_executor.models.kimi_vl', ('KimiVLForConditionalGeneration', ), 'mlp'),
     ]
 
-    # Build supported models list and MLP attribute mapping
     supported_moe_models = []
     mlp_attr_mapping = {}
 
@@ -893,10 +911,32 @@ def patch_vllm_moe_model_weight_loader(model):
                     model_class = getattr(module, class_name)
                     supported_moe_models.append(model_class)
                     mlp_attr_mapping[model_class] = mlp_attr
-        except (ImportError, AttributeError):
+        except (ImportError, AttributeError, RuntimeError):
             pass
 
-    # Early return if no MoE models are supported
+    _moe_model_registry_cache = (supported_moe_models, mlp_attr_mapping)
+    return _moe_model_registry_cache
+
+
+def patch_vllm_moe_model_weight_loader(model):
+    """
+    Patch vLLM MoE model to add weight_loader attribute to expert weights.
+
+    This is a workaround for a bug in vLLM 0.8.2 where MoE weights (w13_weight, w2_weight)
+    don't have the weight_loader attribute, causing AttributeError during weight loading.
+    Code adapted from verl/verl/utils/vllm/patch.py
+
+    Args:
+        model: The vLLM model to patch.
+    """
+    # Check if already patched (idempotent).
+    # Note: the flag can be lost when vLLM sleep/wake_up recreates the model
+    # object, so the expensive import step is cached in _get_moe_model_registry.
+    if getattr(model, '_swift_moe_weight_loader_patched', False):
+        return
+
+    supported_moe_models, mlp_attr_mapping = _get_moe_model_registry()
+
     if not supported_moe_models:
         return
 
@@ -944,6 +984,35 @@ def patch_vllm_moe_model_weight_loader(model):
 
     # Mark the model as patched (for idempotency)
     original_model._swift_moe_weight_loader_patched = True
+
+
+def finish_vllm_weight_reload(vllm_model):
+    """Re-run ``process_weights_after_loading`` on every FusedMoE layer after
+    an in-place vLLM weight update.
+
+    Without this, the second ``model.load_weights`` of an RL training step
+    writes raw checkpoint-format data over the kernel-format buffers and
+    silently corrupts forward output (vLLM issue #42821).
+    """
+    if vllm_model is None:
+        return
+    try:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+    except (ImportError, AttributeError):
+        return  # vLLM is too old to have FusedMoE; nothing to fix.
+    logger = get_logger()
+    for module in vllm_model.modules():
+        if not isinstance(module, FusedMoE):
+            continue
+        quant_method = getattr(module, 'quant_method', None)
+        if quant_method is None or not hasattr(quant_method, 'process_weights_after_loading'):
+            continue
+        try:
+            quant_method.process_weights_after_loading(module)
+        except Exception as e:  # noqa: BLE001
+            logger.warning('finish_vllm_weight_reload: process_weights_after_loading failed '
+                           'on %s: %s',
+                           type(module).__name__, e)
 
 
 def patch_vllm_load_adapter():
@@ -1048,6 +1117,49 @@ def patch_vllm_load_adapter():
             TokenizerGroup.get_lora_tokenizer = patched_get_lora_tokenizer
 
 
+def expand_vllm_param_name_aliases(param_names: set[str]) -> set[str]:
+    stacked_mappings = [
+        (re.compile(r'\bqkv_proj\b'), ('q_proj', 'k_proj', 'v_proj', 'q', 'k', 'v')),
+        (re.compile(r'\bgate_up_proj\b'), ('gate_proj', 'up_proj')),
+        (re.compile(r'\bin_proj_ba\b'), ('in_proj_b', 'in_proj_a')),
+        (re.compile(r'\blanguage_model\.model\b'), ('model.language_model', )),
+        (re.compile(r'^visual\.'), ('model.visual.', )),
+    ]
+
+    def _expand_once(keys: set[str]) -> set[str]:
+        expanded = set(keys)
+        for key in keys:
+            for pattern, aliases in stacked_mappings:
+                if pattern.search(key):
+                    for alias in aliases:
+                        expanded.add(pattern.sub(alias, key))
+        return expanded
+
+    # Two passes allow chained replacement:
+    # e.g. language_model.model + qkv_proj -> model.language_model + q_proj
+    expanded = _expand_once(param_names)
+    expanded = _expand_once(expanded)
+    return expanded
+
+
+def add_base_layer_suffix_by_param_names(weight_iterator: Iterable[Tuple[str, Any]],
+                                         vllm_param_names: set[str]) -> Iterable[Tuple[str, Any]]:
+    """Map HF dense param names to vLLM LoRA-wrapped modules (*.base_layer.weight / .bias)."""
+    for name, tensor in weight_iterator:
+        if '.base_layer.' in name or '.' not in name:
+            yield name, tensor
+            continue
+        if name in vllm_param_names:
+            yield name, tensor
+            continue
+        module_name, param_type = name.rsplit('.', 1)
+        if param_type in {'weight', 'bias'}:
+            bl = f'{module_name}.base_layer.{param_type}'
+            if bl in vllm_param_names:
+                name = bl
+        yield name, tensor
+
+
 # FlattenedTensor, code borrowed from sglang/srt/weight_sync/tensor_bucket.py
 class FlattenedTensorMetadata(BaseModel):
     """Metadata for a tensor in a flattened bucket"""
@@ -1057,18 +1169,6 @@ class FlattenedTensorMetadata(BaseModel):
     start_idx: int
     end_idx: int
     numel: int
-
-    @field_validator('shape', mode='before')
-    @classmethod
-    def ensure_shape_tuple(cls, v: Any) -> Tuple[int, ...]:
-        # accept tuple/list, torch.Size, or other iterable of ints
-        if torch is not None and isinstance(v, torch.Size):
-            return tuple(int(x) for x in v)
-        if isinstance(v, (list, tuple)):
-            return tuple(int(x) for x in v)
-        if isinstance(v, Iterable):
-            return tuple(int(x) for x in v)
-        raise ValueError('shape must be an iterable of ints (e.g. tuple/list/torch.Size)')
 
     @field_validator('dtype', mode='before')
     @classmethod
@@ -1090,7 +1190,6 @@ class TensorMetadata(BaseModel):
 
 
 class UpdateFlattenedAdapterRequest(BaseModel):
-    lora_int_id: int
     peft_config: LoraConfig
     metadatas: List[FlattenedTensorMetadata]
 
@@ -1101,7 +1200,6 @@ class UpdateFlattenedParamsRequest(BaseModel):
 
 class UpdateAdapterRequest(BaseModel):
     """Request for non-flattened adapter weight update"""
-    lora_int_id: int
     peft_config: LoraConfig
     lora_tensors_metadata: List[TensorMetadata]
 
@@ -1118,46 +1216,30 @@ class FlattenedTensorBucket:
         flattened_tensor: torch.Tensor = None,
         metadata: List[FlattenedTensorMetadata] = None,
     ):
-        """
-        Initialize a tensor bucket from a list of named tensors OR from pre-flattened data.
-        Args:
-            named_tensors: List of (name, tensor) tuples (for creating new bucket)
-            flattened_tensor: Pre-flattened tensor (for reconstruction)
-            metadata: Pre-computed metadata (for reconstruction)
-        """
         if named_tensors is not None:
-            # Create bucket from named tensors
-            self.metadata: List[FlattenedTensorMetadata] = [None] * len(named_tensors)
-            self.flattened_tensor: torch.Tensor = None
-
             if not named_tensors:
                 raise ValueError('Cannot create empty tensor bucket')
 
-            # First pass: compute total size and metadata
-            current_idx = 0
-            total_numel = 0
+            self.metadata: List[FlattenedTensorMetadata] = [None] * len(named_tensors)
+            flattened_chunks: List[torch.Tensor] = [None] * len(named_tensors)
+            current_byte = 0
+
             for i, (name, tensor) in enumerate(named_tensors):
-                numel = tensor.numel()
-                metadata_obj = FlattenedTensorMetadata(
+                flat_u8 = tensor.flatten().view(torch.uint8)
+                flattened_chunks[i] = flat_u8
+
+                numel = flat_u8.numel()
+                self.metadata[i] = FlattenedTensorMetadata(
                     name=name,
                     shape=tuple(tensor.shape),
                     dtype=str(tensor.dtype),
-                    start_idx=current_idx,
-                    end_idx=current_idx + numel,
+                    start_idx=current_byte,
+                    end_idx=current_byte + numel,
                     numel=numel,
                 )
-                self.metadata[i] = metadata_obj
-                current_idx += numel
-                total_numel += numel
+                current_byte += numel
 
-            # Pre-allocate the final flattened tensor to avoid intermediate copies
-            # Use the dtype and device of the first tensor
-            first_tensor = named_tensors[0][1]
-            self.flattened_tensor = torch.empty(total_numel, dtype=first_tensor.dtype, device=first_tensor.device)
-
-            # Second pass: copy data directly into pre-allocated tensor
-            for meta, (name, tensor) in zip(self.metadata, named_tensors):
-                self.flattened_tensor[meta.start_idx:meta.end_idx].copy_(tensor.flatten())
+            self.flattened_tensor = torch.cat(flattened_chunks, dim=0)
         else:
             # Initialize from pre-flattened data
             if flattened_tensor is None or metadata is None:
@@ -1182,18 +1264,14 @@ class FlattenedTensorBucket:
         reconstructed = {}
 
         for meta in self.metadata:
-            tensor = self.flattened_tensor[meta.start_idx:meta.end_idx].reshape(meta.shape)
             dtype = getattr(torch, meta.dtype.split('.')[-1])
-            # batch dtype conversion (if needed)
-            if tensor.dtype != dtype:
-                tensor = tensor.to(dtype)
-
+            byte_slice = self.flattened_tensor[meta.start_idx:meta.end_idx]
+            tensor = byte_slice.view(dtype).reshape(meta.shape)
             reconstructed[meta.name] = tensor
-
         return reconstructed
 
 
-def identity_data_collator(features):
+def identity_data_collator(features, **kwargs):
     """Identity data collator that returns features as-is without any processing."""
     return features
 
@@ -1498,6 +1576,15 @@ def check_vllm_version_ge(min_version: str) -> bool:
     return version.parse(vllm_version) >= version.parse(min_version)
 
 
+def vllm_supports_lora_load_inplace() -> bool:
+    """True when vLLM LoRARequest supports load_inplace (replaces same lora_int_id without remove_lora).
+
+    Introduced in vLLM v0.15.0 (see vllm/lora/request.py). Older versions require remove_lora before add_lora
+    when reusing a stable adapter id.
+    """
+    return check_vllm_version_ge('0.15.0')
+
+
 # ============================================================================
 # Padding-free utilities
 # ============================================================================
@@ -1598,3 +1685,232 @@ def pad_logps_back_to_batch(logps_rmpad: Optional[torch.Tensor],
             valid_mask[i, pad_len:] = 1.0
 
     return logps_padded, valid_mask
+
+
+def build_completion_mask_and_seq_lengths(
+    labels: torch.Tensor,
+    batch_size: int,
+    *,
+    padding_free: bool = False,
+    encoded_batch: Optional[dict] = None,
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Build completion_mask and seq_lengths from labels, shared by Ray and non-Ray GRPO paths.
+
+    Args:
+        labels: Label tensor from data collator.
+        batch_size: Number of samples in the batch.
+        padding_free: Whether padding-free (rmpad) mode is used.
+        encoded_batch: The full encoded batch dict (needed for cu_seq_lens / attention_mask).
+        device: Target device for output tensors.
+
+    Returns:
+        (completion_mask, seq_lengths, max_seq_len) where:
+        - completion_mask: [batch_size, max_seq_len] bool tensor
+        - seq_lengths: [batch_size] int tensor
+        - max_seq_len: int
+    """
+    if device is None:
+        device = labels.device
+    if encoded_batch is None:
+        encoded_batch = {}
+
+    rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
+
+    if padding_free:
+        if 'cu_seq_lens_q' in encoded_batch:
+            cu = encoded_batch['cu_seq_lens_q']
+        else:
+            cu = get_packed_seq_params(encoded_batch['position_ids'])['cu_seq_lens_q']
+        seq_lengths = cu[1:] - cu[:-1]
+        max_seq_len = int(seq_lengths.max().item())
+        completion_mask_rmpad = (rolled_labels != -100).float()
+        completion_mask, _ = pad_logps_back_to_batch(
+            logps_rmpad=completion_mask_rmpad,
+            logits_to_keep=max_seq_len,
+            batch_size=batch_size,
+            seq_lengths=seq_lengths,
+            pad_value=0.0)
+        completion_mask = completion_mask.bool()
+    else:
+        attention_mask = encoded_batch.get('attention_mask')
+        if attention_mask is not None:
+            if attention_mask.dim() == 4:
+                attention_mask = attention_mask[:, 0, 0, :]
+            seq_lengths = attention_mask.sum(dim=-1).to(torch.int64)
+        else:
+            seq_lengths = torch.full((batch_size, ), labels.shape[-1], dtype=torch.int64, device=device)
+        max_seq_len = labels.shape[-1]
+        completion_mask = (rolled_labels != -100)
+
+    return completion_mask, seq_lengths, max_seq_len
+
+
+def build_rollout_logps(
+    rollout_batch: 'Sequence[Dict[str, Any]]',
+    completion_mask: torch.Tensor,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Convert per-sample ``rollout_logprobs`` into a [B, T] tensor aligned with completion_mask.
+
+    Shared by Ray GRPOTrainer and non-Ray MegatronGRPOTrainer to avoid
+    duplicating the rollout logprob alignment logic.
+
+    Returns None if logprobs are missing or counts don't match.
+    """
+    lp_list = [data.get('rollout_logprobs') for data in rollout_batch]
+    if not all(lp is not None and lp for lp in lp_list):
+        return None
+
+    batch_size, seq_len = completion_mask.shape
+    rollout_per_token_logps = torch.zeros(batch_size, seq_len, dtype=torch.float32, device=device)
+    for i, nested_lp in enumerate(lp_list):
+        flat_lps = [lp for turn_lps in nested_lp for lp in turn_lps]
+        if not flat_lps:
+            continue
+        if any(lp is None for lp in flat_lps):
+            return None
+        completion_count = int(completion_mask[i].sum().item())
+        if len(flat_lps) == completion_count + 1:
+            flat_lps = flat_lps[:completion_count]
+        if len(flat_lps) != completion_count:
+            return None
+        completion_indices = completion_mask[i].nonzero(as_tuple=True)[0]
+        rollout_per_token_logps[i, completion_indices] = torch.tensor(flat_lps, dtype=torch.float32, device=device)
+    return rollout_per_token_logps
+
+
+def resolve_reward_funcs(
+    reward_funcs_cfg: list,
+    args: Any = None,
+) -> Tuple[List[Any], List[str]]:
+    """Resolve reward function configs into callables and their names.
+
+    Shared between ``MegatronGRPOTrainer._prepare_rewards`` and
+    ``GRPOTrainer._prepare_rewards``.
+
+    Returns:
+        (reward_funcs, reward_func_names)
+    """
+    import asyncio
+    import inspect
+
+    from swift.rewards import orms
+
+    reward_funcs = list(reward_funcs_cfg)
+    for i, reward_func in enumerate(reward_funcs):
+        if isinstance(reward_func, str) and reward_func in orms:
+            reward_funcs[i] = orms[reward_func](args=args) if args is not None else orms[reward_func]()
+        elif not callable(reward_func) and not isinstance(reward_func, str):
+            raise ValueError(f'reward_function {reward_func} is not implemented in swift.rewards')
+
+    names = []
+    for func in reward_funcs:
+        if inspect.isfunction(func):
+            names.append(func.__name__)
+        else:
+            names.append(func.__class__.__name__)
+
+    return reward_funcs, names
+
+
+def make_reward_weights(
+    reward_weights_cfg: Optional[List[float]],
+    num_funcs: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build reward weight tensor, validating length against the reward
+    function count."""
+    if reward_weights_cfg is not None:
+        if len(reward_weights_cfg) != num_funcs:
+            raise ValueError(f'Number of reward weights ({len(reward_weights_cfg)}) must '
+                             f'match number of reward functions ({num_funcs})')
+        return torch.tensor(reward_weights_cfg, dtype=torch.float32, device=device)
+    return torch.ones(num_funcs, dtype=torch.float32, device=device)
+
+
+def detect_async_reward_indices(reward_funcs: list) -> List[int]:
+    import asyncio
+    import torch.nn as nn
+    indices = []
+    for i, func in enumerate(reward_funcs):
+        if not isinstance(func, nn.Module):
+            if asyncio.iscoroutinefunction(func) or asyncio.iscoroutinefunction(getattr(func, '__call__', None)):
+                indices.append(i)
+    return indices
+
+
+def compute_grpo_advantages(
+    rewards_per_func: torch.Tensor,
+    reward_weights: torch.Tensor,
+    num_generations: int,
+    advantage_estimator: str = 'grpo',
+    scale_rewards: str = 'group',
+    kl_in_reward: bool = False,
+    beta: float = 0.0,
+    kl_values: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute advantages from per-function rewards (pure function).
+
+    This implements GRPO / RLOO / REINFORCE++ advantage estimation and
+    normalization.  Both ``MegatronGRPOTrainer._compute_advantages`` and
+    ``GRPOTrainer.compute_advantages`` should delegate to this.
+
+    Args:
+        rewards_per_func: ``[N, n_funcs]`` per-function reward matrix.
+        reward_weights: ``[n_funcs]`` weighting tensor.
+        num_generations: ``K`` — how many completions per prompt.
+        advantage_estimator: ``'grpo'``, ``'rloo'``, or ``'reinforce_plus_plus'``.
+        scale_rewards: ``'batch'``, ``'group'``, ``'none'``, or ``'gdpo'``.
+        kl_in_reward: Whether to subtract KL penalty.
+        beta: KL penalty coefficient.
+        kl_values: ``[N]`` KL values (required if ``kl_in_reward``).
+
+    Returns:
+        ``(advantages, rewards)`` both ``[N]``.
+    """
+    rewards = (rewards_per_func * reward_weights.unsqueeze(0)).nansum(dim=1)
+
+    if kl_in_reward and beta != 0.0 and kl_values is not None:
+        rewards = rewards - beta * kl_values
+
+    K = num_generations
+    grouped = rewards.view(-1, K)
+    group_mean = grouped.mean(dim=1).repeat_interleave(K)
+
+    if advantage_estimator == 'rloo' and K > 1:
+        advantages = rewards * K / (K - 1) - group_mean * K / (K - 1)
+    else:
+        advantages = rewards - group_mean
+
+    std: Optional[torch.Tensor] = None
+    if advantage_estimator == 'reinforce_plus_plus':
+        if scale_rewards == 'batch':
+            std = advantages.std().expand_as(advantages) if advantages.numel() > 1 \
+                else torch.zeros_like(advantages)
+        elif scale_rewards == 'group':
+            std = advantages.view(-1, K).std(dim=1).repeat_interleave(K) if K > 1 \
+                else torch.zeros_like(advantages)
+    else:
+        if scale_rewards == 'batch':
+            std = rewards.std().expand_as(rewards) if rewards.numel() > 1 \
+                else torch.zeros_like(rewards)
+        elif scale_rewards == 'group':
+            std = grouped.std(dim=1).repeat_interleave(K) if K > 1 \
+                else torch.zeros_like(rewards)
+        elif scale_rewards == 'gdpo':
+            num_reward_funcs = rewards_per_func.shape[1]
+            normalized_list = []
+            for i in range(num_reward_funcs):
+                r_i = rewards_per_func[:, i].view(-1, K)
+                g_mean = r_i.mean(dim=1, keepdim=True)
+                g_std = r_i.std(dim=1, keepdim=True) + 1e-8
+                normalized_list.append(reward_weights[i] * ((r_i - g_mean) / g_std).view(-1))
+            summed = sum(normalized_list)
+            advantages = (summed - summed.mean()) / (summed.std() + 1e-8)
+            std = None
+
+    if std is not None and scale_rewards != 'none':
+        advantages = advantages / (std + 1e-4)
+
+    return advantages, rewards

@@ -16,6 +16,7 @@ from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dacite import from_dict
 from functools import partial
+from mcore_bridge import set_random_seed
 from megatron.core import mpu
 from megatron.core.rerun_state_machine import RerunDataIterator
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -23,11 +24,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from swift.dataset import RowPreprocessor
 from swift.infer_engine.protocol import RequestConfig, RolloutInferRequest, RolloutOutput
 from swift.megatron.arguments import MegatronArguments, MegatronRLHFArguments
-from swift.megatron.utils import forward_step_helper, get_padding_to, set_random_seed
-from swift.rewards import orms
+from swift.megatron.utils import RouterReplayHelper, get_padding_to, set_router_replay_data
 from swift.rlhf_trainers.grpo_trainer import DataType
-from swift.rlhf_trainers.utils import (aggressive_empty_cache, nanstd, pad_logps_back_to_batch, profiling_context,
-                                       profiling_decorator, replace_assistant_response_with_ids,
+from swift.rlhf_trainers.utils import (aggressive_empty_cache, detect_async_reward_indices, make_reward_weights, nanstd,
+                                       pad_logps_back_to_batch, profiling_context, profiling_decorator,
+                                       replace_assistant_response_with_ids, resolve_reward_funcs,
                                        set_expandable_segments)
 from swift.rollout import MultiTurnScheduler, multi_turns
 from swift.template import Template, TemplateInputs
@@ -38,7 +39,34 @@ from .rollout_mixin import MegatronRolloutMixin
 from .utils import gather, gather_object
 from .vocab_parallel_utils import compute_logps_and_entropy_from_logits
 
+try:
+    from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
+except ImportError:
+    RouterReplay = None
+    RouterReplayAction = None
+
 logger = get_logger()
+
+GRPO_NON_MODEL_KEYS = frozenset({
+    'logits_to_keep',
+    'completion_mask',
+    'ref_per_token_logps',
+    'advantages',
+    'old_per_token_logps',
+    'truncated_mask',
+    'seq_lengths',
+    'num_items_in_batch',
+    'rollout_per_token_logps',
+})
+
+FILTERED_KEYS = frozenset({
+    'prompt_id',
+    'request_id',
+    'response_token_ids',
+    'finish_reason',
+    'is_truncated',
+    'add_eos',
+})
 
 
 class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
@@ -82,6 +110,15 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         # SAPO, https://arxiv.org/abs/2511.20347
         self.tau_pos = args.tau_pos
         self.tau_neg = args.tau_neg
+
+        # REAL, https://arxiv.org/abs/2602.05630
+        self.real_tau = args.real_tau
+
+        # FIPO, https://arxiv.org/abs/2603.19835
+        self.fipo_gamma = 2**(-1 / args.fipo_decay_rate)
+        self.fipo_clip_range = args.fipo_clip_range
+        self.fipo_clip_high_only = args.fipo_clip_high_only
+        self.fipo_safety_threshold = args.fipo_safety_threshold
 
         # DAPO, https://arxiv.org/abs/2503.14476
         self.dynamic_sample = args.dynamic_sample
@@ -134,58 +171,23 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                              'please update vLLM to 0.10.2 or later.')
 
     def _prepare_rewards(self):
-        # TODO: reward model
         args = self.args
-        reward_funcs = args.reward_funcs.copy()
-        if not isinstance(reward_funcs, list):
-            reward_funcs = [reward_funcs]
+        reward_funcs_cfg = args.reward_funcs.copy()
+        if not isinstance(reward_funcs_cfg, list):
+            reward_funcs_cfg = [reward_funcs_cfg]
 
-        # initilize reward functions
-        if reward_funcs:
-            for i, reward_func in enumerate(reward_funcs):
-                if reward_func in orms:
-                    reward_func_class = orms[reward_func]
-                    reward_funcs[i] = reward_func_class(args=self.args)
-                elif not callable(reward_func):
-                    raise ValueError(f'reward_function {reward_func} is not implemented in swift.rewards')
+        self.reward_funcs, self.reward_func_names = resolve_reward_funcs(reward_funcs_cfg, args=self.args)
+        self.reward_weights = make_reward_weights(args.reward_weights, len(self.reward_funcs), self.device)
 
-        # get reward name for logging
-        self.reward_funcs = reward_funcs
-        self.reward_func_names = []
-        for reward_func in reward_funcs:
-            if inspect.isfunction(reward_func):
-                reward_func_name = reward_func.__name__
-            else:
-                reward_func_name = reward_func.__class__.__name__
-            self.reward_func_names.append(reward_func_name)
-
-        # set reward weights
-        if args.reward_weights is not None:
-            if len(args.reward_weights) != len(reward_funcs):
-                raise ValueError(f'Number of reward weights ({len(args.reward_weights)}) must match number of reward '
-                                 f'functions ({len(reward_funcs)})')
-            self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32).to(self.device)
-        else:
-            self.reward_weights = torch.ones(len(self.reward_func_names), dtype=torch.float32).to(self.device)
-
-        # TODO: reward models
         self.reward_model_plugins = [None] * len(self.reward_funcs)
 
         assert self.reward_funcs, 'reward_funcs is not set'
 
-        # Pre-compute which reward functions are async to avoid repeated checks during computation
-        # _async_reward_func_indices stores the index of each async reward function
-        self._async_reward_func_indices = []
-        for i, func in enumerate(self.reward_funcs):
-            if not isinstance(func, nn.Module):
-                if asyncio.iscoroutinefunction(func) or asyncio.iscoroutinefunction(getattr(func, '__call__', None)):
-                    self._async_reward_func_indices.append(i)
+        self._async_reward_func_indices = detect_async_reward_indices(self.reward_funcs)
 
-        # Initialize event loop for async reward functions if needed
         if self._async_reward_func_indices:
             self.async_reward_loop_thread, self.async_reward_loop, self.async_reward_loop_ready_event = (
                 start_event_loop_in_daemon(name='MegatronGRPOTrainer-AsyncRewardLoop'))
-            # Wait until the event loop is running in the daemon thread
             self.async_reward_loop_ready_event.wait()
             atexit.register(shutdown_event_loop_in_daemon, self.async_reward_loop_thread, self.async_reward_loop)
 
@@ -262,7 +264,12 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             batched_inputs = []
             for i, future in enumerate(futures):
                 try:
-                    batched_inputs.append(future.result())
+                    encoded = future.result()
+                    extra_kwargs = encoded.get('_extra_kwargs') or {}
+                    for k in list(extra_kwargs.keys()):
+                        if k not in FILTERED_KEYS:
+                            extra_kwargs.pop(k)
+                    batched_inputs.append(encoded)
                 except Exception as e:
                     if strict:
                         raise
@@ -271,6 +278,10 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         return batched_inputs, error_list
 
     def _get_encoded_batch(self, encoded_list, rollout_batch, template):
+        original_seq_lengths = [item['length'] for item in encoded_list]
+
+        from swift.rlhf_trainers.utils import build_completion_mask_and_seq_lengths, build_rollout_logps
+
         args = self.args
         encoded_batch = to_device(template.data_collator(encoded_list, padding_to=get_padding_to(args)), self.device)
 
@@ -279,88 +290,59 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         truncated_mask = torch.tensor([b['is_truncated'] for b in rollout_batch], dtype=torch.bool, device=self.device)
 
-        rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
-
-        if template.padding_free:
-            # In padding_free mode, labels shape is [1, total_seq_len] (rmpad format)
-            # Calculate seq_lengths from cu_seq_lens or position_ids
-            if 'cu_seq_lens_q' in encoded_batch:
-                cu_seq_lens_q = encoded_batch['cu_seq_lens_q']
-            else:
-                cu_seq_lens_q = get_packed_seq_params(encoded_batch['position_ids'])['cu_seq_lens_q']
-            seq_lengths = cu_seq_lens_q[1:] - cu_seq_lens_q[:-1]
-            max_seq_len = seq_lengths.max().item()
-
-            # completion_mask in rmpad format [1, total_tokens]
-            completion_mask_rmpad = (rolled_labels != -100).float()
-            completion_mask, _ = pad_logps_back_to_batch(
-                logps_rmpad=completion_mask_rmpad,
-                logits_to_keep=max_seq_len,
-                batch_size=batch_size,
-                seq_lengths=seq_lengths,
-                pad_value=0.0)
-            completion_mask = completion_mask.bool()
-        else:
-            # In non-padding_free mode, labels shape is [batch_size, seq_len] (batch format)
-            # Calculate seq_lengths from attention_mask
-            attention_mask = encoded_batch.get('attention_mask')
-            if attention_mask is not None:
-                # attention_mask shape: [batch_size, seq_len] or [batch_size, 1, 1, seq_len]
-                if attention_mask.dim() == 4:
-                    attention_mask = attention_mask[:, 0, 0, :]
-                seq_lengths = attention_mask.sum(dim=-1).to(torch.int64)
-            else:
-                # Fallback: assume full sequence length for each sample
-                seq_lengths = torch.full((batch_size, ), labels.shape[-1], dtype=torch.int64, device=self.device)
-            max_seq_len = labels.shape[-1]
-
-            # completion_mask based on rolled labels for alignment with per_token_logps
-            completion_mask = (rolled_labels != -100)
+        completion_mask, seq_lengths, max_seq_len = build_completion_mask_and_seq_lengths(
+            labels,
+            batch_size,
+            padding_free=template.padding_free,
+            encoded_batch=encoded_batch,
+            device=self.device,
+        )
 
         encoded_batch.update({
-            'completion_mask': completion_mask,  # [batch_size, max_seq_len]
-            'truncated_mask': truncated_mask,  # [batch_size]
+            'completion_mask': completion_mask,
+            'truncated_mask': truncated_mask,
             'num_samples': batch_size,
-            'seq_lengths': seq_lengths,  # [batch_size]
+            'seq_lengths': seq_lengths,
         })
 
-        # Process rollout_logprobs for importance sampling correction
-        rollout_per_token_logps = None
-        rollout_logprobs_list = [data.get('rollout_logprobs') for data in rollout_batch]
-        if all(lp is not None and lp for lp in rollout_logprobs_list):
-            # Validate that logprobs count matches completion tokens count
-            valid_logprobs = True
-            for i, nested_lp in enumerate(rollout_logprobs_list):
-                total_logprobs = sum(len(turn_lps) for turn_lps in nested_lp)
-                completion_count = int(completion_mask[i].sum().item())
-                if total_logprobs != completion_count:
-                    logger.warning(f'Rollout logprobs count ({total_logprobs}) does not match '
-                                   f'completion tokens count ({completion_count}). '
-                                   f'Skipping rollout importance sampling for this batch.')
-                    valid_logprobs = False
-                    break
+        encoded_batch['rollout_per_token_logps'] = build_rollout_logps(rollout_batch, completion_mask, self.device)
 
-            if valid_logprobs:
-                batch_size = completion_mask.shape[0]
-                seq_len = completion_mask.shape[1]
-                rollout_per_token_logps = torch.zeros(batch_size, seq_len, dtype=torch.float32, device=self.device)
-                for i, nested_lp in enumerate(rollout_logprobs_list):
-                    # Flatten logprobs for this sample
-                    flat_lps = [lp for turn_lps in nested_lp for lp in turn_lps]
-                    if flat_lps:
-                        # Check for None values in flat_lps
-                        if any(lp is None for lp in flat_lps):
-                            logger.warning('Found None values in rollout_logprobs. '
-                                           'Skipping rollout importance sampling for this batch.')
-                            rollout_per_token_logps = None
-                            break
-                        # Get indices where completion_mask is True
-                        completion_indices = completion_mask[i].nonzero(as_tuple=True)[0]
-                        # Scatter logprobs to completion positions
-                        rollout_per_token_logps[i, completion_indices] = torch.tensor(
-                            flat_lps, dtype=torch.float32, device=self.device)
+        # Validating and processing routed_experts data in R3 mode
+        if self.args.router_replay_mode == 'R3':
+            routed_experts_list = []
+            cur_seq_lengths = seq_lengths
+            if (seq_lengths.size(0) > batch_size):
+                cur_seq_lengths = seq_lengths[:batch_size].clone()
+                cur_seq_lengths[batch_size - 1] = seq_lengths[batch_size - 1:].sum()
+            for data, original_seq_len, cur_seq_len in zip(rollout_batch, original_seq_lengths, cur_seq_lengths):
+                routed_experts = data.get('routed_experts')
+                assert routed_experts is not None, (
+                    'When router_replay_mode = R3, routed_experts must be in rollout data')
+                routed_experts = torch.tensor(routed_experts)
+                # The number of experts in the output can be 1 less than (prompt_length + response_token_count)
+                # This gap of 1 is expected
+                # For more details, please refer PR https://github.com/vllm-project/vllm/pull/28284
+                experts_seq_len = routed_experts.shape[0]
+                assert (experts_seq_len == original_seq_len or experts_seq_len + 1
+                        == original_seq_len), (f'The seq_len of routed_experts({experts_seq_len}) in output ',
+                                               f'does not match the seq_len of data({original_seq_len}), '
+                                               'should be equal to or 1 less than the seq_len of data')
+                # Padding routed_experts(seq_len, layer_num, topk) seq_len to match the seq_len of the input_ids
+                padding_routed_experts = routed_experts
+                padding_to = cur_seq_len if template.padding_free else max_seq_len
+                padding_len = padding_to - experts_seq_len
+                if padding_len > 0:
+                    padding_right = template.padding_side == 'right'
+                    padding_routed_experts = nn.functional.pad(routed_experts,
+                                                               (0, 0, 0, 0, 0, padding_len) if padding_right else
+                                                               (0, 0, 0, 0, padding_len, 0), 'constant', 0)
+                routed_experts_list.append(padding_routed_experts)
+            if template.padding_free:
+                global_routed_experts = torch.cat(routed_experts_list, dim=0).unsqueeze(0)
+            else:
+                global_routed_experts = torch.stack(routed_experts_list)
+            encoded_batch['routed_experts'] = global_routed_experts.to(device=self.device)
 
-        encoded_batch['rollout_per_token_logps'] = rollout_per_token_logps
         return encoded_batch
 
     def _generate_and_score_completions(self, batch):
@@ -418,7 +400,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             micro_batch_advantages = total_advantages[start_idx:end_idx]
             micro_batch_encoded['advantages'] = micro_batch_advantages
 
-        if self.loss_type in ['cispo', 'dapo']:
+        if self.loss_type in ['cispo', 'dapo', 'fipo']:
             # Calculate num_items_in_batch
             # Count completion tokens from all mini_batch_data (this includes gathered data from rollout_group)
             # Use completion_mask.sum() for both padding_free and non-padding_free modes
@@ -435,11 +417,58 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 mpu.get_tensor_model_parallel_world_size() * mpu.get_pipeline_model_parallel_world_size()
                 * mpu.get_context_parallel_world_size())
             num_items_in_batch = total_token_count_tensor / rollout_group_size
-            # Store num_items_in_batch in each mini_batch_data for CISPO/DAPO loss normalization
+            # Store num_items_in_batch in each mini_batch_data for token-normalized losses
             for batch_data in mini_batch_data:
                 batch_data['num_items_in_batch'] = num_items_in_batch
 
         return mini_batch_data
+
+    def _compute_fipo_influence(self, log_ratio: torch.Tensor, coef_1: torch.Tensor, advantages: torch.Tensor,
+                                completion_mask: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute FIPO token-level influence weight from discounted Future-KL."""
+        future_kl_delta = log_ratio.masked_fill(~completion_mask, 0.0)
+
+        if self.args.delta is not None:
+            delta = torch.as_tensor(self.args.delta, dtype=log_ratio.dtype, device=log_ratio.device)
+            high_ratio_mask = coef_1 > delta
+            future_kl_delta = torch.where(high_ratio_mask, torch.zeros_like(future_kl_delta), future_kl_delta)
+
+        seq_len = future_kl_delta.shape[1]
+        future_kl = torch.zeros_like(future_kl_delta)
+        positions = torch.arange(seq_len, device=log_ratio.device).unsqueeze(1)
+        gamma = torch.as_tensor(self.fipo_gamma, dtype=log_ratio.dtype, device=log_ratio.device)
+        chunk_size = 128
+        for chunk_start in range(0, seq_len, chunk_size):
+            chunk_end = min(seq_len, chunk_start + chunk_size)
+            chunk_positions = torch.arange(chunk_start, chunk_end, device=log_ratio.device).unsqueeze(0)
+            distance = chunk_positions - positions
+            future_mask = distance >= 0
+            decay_block = torch.pow(gamma, distance.clamp(min=0)) * future_mask.to(log_ratio.dtype)
+            future_kl += torch.matmul(future_kl_delta[:, chunk_start:chunk_end], decay_block.t())
+        future_kl = future_kl.masked_fill(~completion_mask, 0.0)
+
+        influence_weight = torch.exp(future_kl)
+
+        if self.fipo_clip_range:
+            high = 1 + self.fipo_clip_range
+            low = 1.0 if self.fipo_clip_high_only else 1 - self.fipo_clip_range
+            influence_weight = torch.clamp(influence_weight, min=low, max=high)
+        influence_weight = influence_weight.detach()
+
+        safety_mask = torch.ones_like(completion_mask, dtype=torch.bool)
+        if self.fipo_safety_threshold is not None:
+            negative_advantage = advantages.unsqueeze(1) < 0
+            high_is_ratio = coef_1 > self.fipo_safety_threshold
+            safety_mask = ~(negative_advantage & high_is_ratio)
+            influence_weight = torch.where(safety_mask, influence_weight,
+                                           torch.clamp(influence_weight, min=0.8, max=1.0))
+
+        metrics = {
+            'future_kl': future_kl,
+            'influence_weight': influence_weight,
+            'safety_mask': safety_mask,
+        }
+        return influence_weight, metrics
 
     @profiling_decorator
     def _generate_completions(self, batch):
@@ -558,6 +587,9 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 if 'content' in choice.logprobs:
                     rollout_logprobs = [item['logprob'] for item in choice.logprobs['content']]
                     input_data['rollout_logprobs'] = [rollout_logprobs]
+
+            # Step 6: Store rollout routed_experts for routing replay
+            input_data['routed_experts'] = choice.routed_experts
             return input_data
 
         assert len(batch) == len(outputs)
@@ -938,7 +970,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             with self.null_ref_context() as ref_models:
                 assert len(ref_models) == 1, 'GRPO currently does not support VPP.'
                 ref_model = ref_models[0]
-                ref_per_token_logps_packed = self.compute_per_token_logps(
+                ref_per_token_logps_packed, _ = self.compute_per_token_logps(
                     ref_model, iter([deepcopy(inputs)]), temperature=self.temperature)
                 if self.template.padding_free:
                     ref_per_token_logps, _ = pad_logps_back_to_batch(
@@ -950,7 +982,13 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     ref_per_token_logps = ref_per_token_logps_packed
                 batch['ref_per_token_logps'] = ref_per_token_logps
 
-        old_per_token_logps_packed = self.compute_per_token_logps(
+        if self.enable_routing_replay:
+            if self.args.router_replay_mode == 'R2':
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+            if self.args.router_replay_mode == 'R3':
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
+        old_per_token_logps_packed, routing_topk_idx = self.compute_per_token_logps(
             self.unwrapped_models[0], iter([deepcopy(inputs)]), temperature=self.temperature)
         if self.template.padding_free:
             old_per_token_logps, _ = pad_logps_back_to_batch(
@@ -961,6 +999,11 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         else:
             old_per_token_logps = old_per_token_logps_packed
         batch['old_per_token_logps'] = old_per_token_logps
+
+        if self.enable_routing_replay:
+            batch['routed_experts'] = routing_topk_idx
+            RouterReplay.clear_global_indices()
+            RouterReplay.clear_global_router_replay_action()
 
         return batch
 
@@ -1041,6 +1084,15 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'seq_lengths': seq_lengths,
         })
         data.pop('loss_scale', None)
+
+        if self.enable_routing_replay and RouterReplayHelper.is_replay_backward_action(model.config):
+            router_instance_list = RouterReplayHelper.get_micro_batch_router_list(model.config)
+            for router in router_instance_list:
+                router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        if self.enable_routing_replay and RouterReplayHelper.is_replay_forward_action(model.config):
+            layers_topk_idx = data.pop('routed_experts', None)
+            set_router_replay_data(layers_topk_idx, model.config)
+
         inputs = self._prepare_model_inputs(data)
 
         labels = data['labels']
@@ -1091,6 +1143,11 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             output_tensor = per_token_logps
             data['per_token_entropy'] = per_token_entropy
 
+        if self.enable_routing_replay and RouterReplayHelper.is_replay_forward_action(model.config):
+            router_instance_list = RouterReplayHelper.get_micro_batch_router_list(model.config)
+            for router in router_instance_list:
+                router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+
         return output_tensor, partial(self.loss_func, data=data)
 
     @profiling_decorator
@@ -1115,13 +1172,17 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         # Rollout importance sampling correction
         rollout_correction_metrics = {}
         rollout_is_weights = None
-        should_compute_rollout_metrics = (
-            self.rollout_importance_sampling_mode is not None or self.log_rollout_offpolicy_metrics)
-        local_has_rollout_per_token_logps = rollout_per_token_logps is not None
-        dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
-        all_has_rollout_per_token_logps = gather_object([local_has_rollout_per_token_logps], group=dp_group)
-        should_compute_rollout_metrics = should_compute_rollout_metrics and all(all_has_rollout_per_token_logps)
-        if (not self.disable_rollout_importance_sampling and should_compute_rollout_metrics):
+        should_compute_rollout_metrics = (not self.disable_rollout_importance_sampling
+                                          and (self.rollout_importance_sampling_mode is not None
+                                               or self.log_rollout_offpolicy_metrics))
+        if should_compute_rollout_metrics:
+            dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            has_flag = torch.tensor([1 if rollout_per_token_logps is not None else 0],
+                                    dtype=torch.int32,
+                                    device=per_token_logps.device)
+            torch.distributed.all_reduce(has_flag, op=torch.distributed.ReduceOp.MIN, group=dp_group)
+            should_compute_rollout_metrics = has_flag.item() > 0
+        if should_compute_rollout_metrics:
             # Compute off-policy diagnostic metrics
             rollout_correction_metrics = self._compute_rollout_offpolicy_metrics(old_per_token_logps,
                                                                                  rollout_per_token_logps,
@@ -1152,8 +1213,8 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         # Only compute KL for loss if kl_in_reward=False (GRPO style)
         # When kl_in_reward=True, KL penalty is already applied to rewards in _compute_advantages
         if self.beta != 0.0 and ref_per_token_logps is not None and not self.kl_in_reward:
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1)
+            safe_ratio = torch.clamp(ref_per_token_logps - per_token_logps, min=-20, max=20)
+            per_token_kl = torch.clamp(torch.exp(safe_ratio) - safe_ratio - 1, min=-10, max=10)
         else:
             per_token_kl = None
 
@@ -1179,6 +1240,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         coef_1 = torch.exp(log_importance_weights)
 
+        fipo_metrics = None
         if self.loss_type == 'cispo':
             clamped_ratios = torch.clamp(coef_1, max=self.epsilon_high).detach()
             per_token_loss = -clamped_ratios * advantages.unsqueeze(1) * per_token_logps
@@ -1188,7 +1250,10 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             is_positive = advantages.unsqueeze(1) > 0
             soft_gate = torch.where(is_positive, gate_pos, gate_neg)
             per_token_loss = -soft_gate * advantages.unsqueeze(1)
-        elif self.loss_type in ['grpo', 'bnpo', 'dr_grpo', 'dapo']:
+        elif self.loss_type in ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'fipo']:
+            if self.loss_type == 'fipo':
+                fipo_weight, fipo_metrics = self._compute_fipo_influence(log_ratio, coef_1, advantages, completion_mask)
+
             coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
             if self.args.delta is not None:
                 coef_1 = torch.clamp(coef_1, max=self.args.delta)
@@ -1196,6 +1261,10 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             per_token_loss1 = coef_1 * advantages.unsqueeze(1)
             per_token_loss2 = coef_2 * advantages.unsqueeze(1)
             per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+            if self.loss_type == 'fipo':
+                per_token_loss = per_token_loss * fipo_weight
+        elif self.loss_type == 'real':
+            per_token_loss = torch.zeros_like(per_token_logps)
         else:
             raise ValueError(f'Unknown loss type: {self.loss_type}')
 
@@ -1260,12 +1329,45 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
         elif self.loss_type == 'dr_grpo':
             loss = (per_token_loss * completion_mask).sum() / (micro_batch_size * self.max_completion_length)
-        elif self.loss_type in ['cispo', 'dapo']:
-            # CISPO and DAPO: Normalize by total completion tokens across all processes
+        elif self.loss_type in ['cispo', 'dapo', 'fipo']:
+            # CISPO, DAPO, and FIPO: Normalize by total completion tokens across all processes
             num_items_in_batch = data['num_items_in_batch']
             dp_size = mpu.get_data_parallel_world_size()
             normalizer = num_items_in_batch / dp_size
             loss = (per_token_loss * completion_mask).sum() / normalizer.clamp(min=1.0)
+        elif self.loss_type == 'real':
+            global_scores = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+
+            group_scores = global_scores.view(-1, self.num_generations)
+            group_rewards = advantages.view(-1, self.num_generations)
+
+            pos_mask = (group_rewards > 0)
+            neg_mask = (group_rewards <= 0)
+            valid_mask = (pos_mask.sum(dim=1) != 0) & (neg_mask.sum(dim=1) != 0)
+
+            if not valid_mask.any():
+                loss = torch.tensor(0., device=global_scores.device) * global_scores.mean()
+            else:
+                batch_scores = group_scores[valid_mask]
+                batch_pos_mask = pos_mask[valid_mask]
+                batch_neg_mask = neg_mask[valid_mask]
+
+                scaled_scores = batch_scores / self.real_tau
+                zeros = torch.zeros(batch_scores.size(0), 1, device=batch_scores.device, dtype=batch_scores.dtype)
+
+                # Negative Loss: log(1 + sum(e^{S_neg}))
+                neg_input = scaled_scores.masked_fill(~batch_neg_mask, float('-inf'))
+                neg_loss = torch.logsumexp(torch.cat([neg_input, zeros], dim=1), dim=1)
+
+                # Positive Loss: log(1 + sum(e^{-S_pos}))
+                pos_input = (-scaled_scores).masked_fill(~batch_pos_mask, float('-inf'))
+                pos_loss = torch.logsumexp(torch.cat([pos_input, zeros], dim=1), dim=1)
+
+                loss = (neg_loss + pos_loss).sum() / group_rewards.size(0)
+
+            if self.beta != 0.0 and per_token_kl is not None:
+                kl_loss = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+                loss = loss + kl_loss * self.beta
         else:
             raise ValueError(f'Unknown loss type: {self.loss_type}')
 
@@ -1297,6 +1399,14 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         # Compute clipping metrics
         completion_token_count = completion_mask.sum().clamp(min=1.0)
+        if fipo_metrics is not None:
+            avg_metric['fipo/future_kl_mean'] = ((fipo_metrics['future_kl'] * completion_mask).sum()
+                                                 / completion_token_count).clone().detach()
+            avg_metric['fipo/influence_weight_mean'] = ((fipo_metrics['influence_weight'] * completion_mask).sum()
+                                                        / completion_token_count).clone().detach()
+            avg_metric['fipo/safety_keep_ratio'] = ((fipo_metrics['safety_mask'].float() * completion_mask).sum()
+                                                    / completion_token_count).clone().detach()
+
         if self.loss_type == 'cispo':
             # CISPO: Only track upper bound clipping
             # coef_1 is [batch_size, max_seq_len] or [batch_size, 1] depending on importance_sampling_level
@@ -1304,10 +1414,10 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             cispo_clip_ratio = (is_cispo_clipped.float() * completion_mask).sum() / completion_token_count
             # Store local clip ratio, _all_reduce_metric will handle averaging across ranks
             self._metrics[mode]['cispo_clip_ratio'].append(cispo_clip_ratio)
-        elif self.loss_type == 'sapo':
-            # SAPO: No hard clipping, skip clipping metrics
+        elif self.loss_type in ['sapo', 'real']:
+            # SAPO / REAL: No hard clipping, skip clipping metrics
             pass
-        elif self.loss_type in ['grpo', 'bnpo', 'dr_grpo', 'dapo']:
+        elif self.loss_type in ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'fipo']:
             # coef_1 is [batch_size, max_seq_len] or [batch_size, 1] depending on importance_sampling_level
             # Use exp(log_importance_weights) to get the original ratios before clamping
             coef_1_for_metrics = torch.exp(log_importance_weights)
@@ -1359,8 +1469,10 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'gen_step': [self._step - 1] * len(self._logs['prompt']),
                 'prompt': list(self._logs['prompt']),
                 'completion': list(self._logs['completion']),
-                **{k: list(v)
-                   for k, v in self._logs['rewards'].items()},
+                **{
+                    k: list(v)
+                    for k, v in self._logs['rewards'].items()
+                },
                 'advantages': list(self._logs['advantages']),
             }
             self.jsonl_writer.append(table)
@@ -1454,7 +1566,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def _preprocess_inputs(self, inputs: DataType) -> DataType:
         """Preprocess inputs before inference"""
-        processed_inputs = self._add_prompt_id_to_inputs(inputs)
+        processed_inputs = self._add_request_id_to_inputs(inputs)
         for input_item in processed_inputs:
             remove_response(input_item['messages'])
         return processed_inputs
@@ -1520,24 +1632,12 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         return valid_samples[:required_count]
 
-    def _add_prompt_id_to_inputs(self, inputs: DataType) -> DataType:
-        """Add unique prompt_id and request_id to each input"""
+    def _add_request_id_to_inputs(self, inputs: DataType) -> DataType:
+        """Add unique request_id to each input"""
         if not inputs:
             return inputs
 
-        all_messages = gather_object([inp['messages'] for inp in inputs])
-        messages_to_prompt_id = {}
-        prompt_id_counter = 0
-
-        for messages in all_messages:
-            key = json.dumps(messages)
-            if key not in messages_to_prompt_id:
-                messages_to_prompt_id[key] = f'prompt_{prompt_id_counter}'
-                prompt_id_counter += 1
-
         for input_item in inputs:
-            messages = input_item.get('messages')
-            input_item['prompt_id'] = messages_to_prompt_id[json.dumps(messages)]
             input_item['request_id'] = f'chatcmpl-{str(uuid.uuid4().hex)}'
 
         return inputs
@@ -1814,7 +1914,8 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         metrics['kl'] = gather(kl.unsqueeze(0), group=dp_group).nanmean()
 
         # 2b. k3_kl: K3 estimator for KL
-        k3_kl_matrix = torch.exp(log_ratio) - log_ratio - 1
+        log_ratio_safe = torch.clamp(log_ratio, min=-20, max=20)
+        k3_kl_matrix = torch.clamp(torch.exp(log_ratio_safe) - log_ratio_safe - 1, min=-10, max=10)
         k3_kl = masked_mean(k3_kl_matrix, completion_mask)
         metrics['k3_kl'] = gather(k3_kl.unsqueeze(0), group=dp_group).nanmean()
 
@@ -1911,14 +2012,9 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         return metrics
 
     def _prepare_model_inputs(self, inputs: 'DataType') -> Dict[str, Any]:
-        """Filters inputs to create model_inputs, removing GRPO-specific keys."""
-        return {
-            k: v
-            for k, v in inputs.items() if k not in [
-                'logits_to_keep', 'completion_mask', 'ref_per_token_logps', 'advantages', 'old_per_token_logps',
-                'truncated_mask', 'seq_lengths', 'num_items_in_batch', 'rollout_per_token_logps'
-            ]
-        }
+        """Filters inputs to create model_inputs, removing GRPO-specific and template extra keys."""
+        excluded = GRPO_NON_MODEL_KEYS | FILTERED_KEYS
+        return {k: v for k, v in inputs.items() if k not in excluded}
 
     def _collect_config_info(self) -> Dict[str, str]:
         config = {

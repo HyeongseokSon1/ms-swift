@@ -18,7 +18,7 @@ class DeepseekLoader(ModelLoader):
     def get_model(self, model_dir: str, *args, **kwargs) -> PreTrainedModel:
         model = super().get_model(model_dir, *args, **kwargs)
         # fix dtype bug
-        mlp_cls = model.model.layers[1].mlp.__class__
+        mlp_cls = model.model.layers[-1].mlp.__class__
 
         for module in model.modules():
             if isinstance(module, mlp_cls):
@@ -163,6 +163,23 @@ register_model(
         DeepseekV32Loader,
         template=TemplateType.deepseek_v3_1,
         architectures=['DeepseekV32ForCausalLM'],
+    ))
+
+register_model(
+    ModelMeta(
+        LLMModelType.deepseek_v4,
+        [
+            ModelGroup([
+                Model('deepseek-ai/DeepSeek-V4-Flash', 'deepseek-ai/DeepSeek-V4-Flash'),
+                Model('deepseek-ai/DeepSeek-V4-Flash-Base', 'deepseek-ai/DeepSeek-V4-Flash-Base'),
+            ]),
+            ModelGroup([
+                Model('deepseek-ai/DeepSeek-V4-Pro', 'deepseek-ai/DeepSeek-V4-Pro'),
+                Model('deepseek-ai/DeepSeek-V4-Pro-Base', 'deepseek-ai/DeepSeek-V4-Pro-Base'),
+            ]),
+        ],
+        template=TemplateType.deepseek_v4,
+        architectures=['DeepseekV4ForCausalLM'],
     ))
 
 

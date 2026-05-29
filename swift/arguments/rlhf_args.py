@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from swift.model import MODEL_MAPPING
 from swift.rlhf_trainers import GRPOArgumentsMixin
+from swift.template import TEMPLATE_MAPPING
 from swift.utils import get_current_device, get_logger, is_master, is_mp, json_parse_to_dict, set_default_ddp_config
 from .sft_args import SftArguments
 
@@ -25,12 +26,15 @@ class RewardModelArguments:
             If not specified, it's often inferred. Defaults to None.
         reward_model_revision (Optional[List[str]]): The specific model version to use for the reward model. Same as
             the `model_revision` argument. Defaults to None.
+        reward_template (Optional[List[str]]): The template to use for the reward model. Defaults to None.
     """
     reward_model: Optional[List[str]] = None
     reward_adapters: List[str] = field(default_factory=list)
     reward_model_type: Optional[List[str]] = field(
         default=None, metadata={'help': f'model_type choices: {list(MODEL_MAPPING.keys())}'})
     reward_model_revision: Optional[List[str]] = None
+    reward_template: Optional[List[str]] = field(
+        default=None, metadata={'help': f'template choices: {list(TEMPLATE_MAPPING.keys())}'})
 
 
 @dataclass
@@ -378,6 +382,13 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             else:
                 raise ValueError(f'Invalid advantage_estimator: {self.advantage_estimator}')
 
+        # disable normalization, REAL https://arxiv.org/abs/2602.05630
+        if self.loss_type == 'real':
+            self.scale_rewards = 'none'
+            logger.warning(
+                f"[REAL] scale_rewards='{self.scale_rewards}' is ignored. "
+                "It will be forced to 'none' because 'loss_type = real' does not support reward normalization.")
+
         if self.scale_rewards is None:
             if self.advantage_estimator == 'grpo':
                 self.scale_rewards = 'group'
@@ -424,10 +435,12 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         self.max_completion_length = self.max_new_tokens = self.response_length = max_completion_length
 
     def _init_metric_for_best_model(self):
-        if self.rlhf_type not in {'ppo', 'grpo'}:
-            super()._init_metric_for_best_model()
-        elif self.rlhf_type == 'grpo' and self.metric_for_best_model is None:
+        if self.rlhf_type == 'grpo' and self.metric_for_best_model is None:
             self.metric_for_best_model = 'reward'
+        super()._init_metric_for_best_model()
+        if self.rlhf_type == 'ppo':
+            self.metric_for_best_model = None
+            self.greater_is_better = None
 
     def _init_simpo(self):
         if self.rlhf_type != 'simpo':

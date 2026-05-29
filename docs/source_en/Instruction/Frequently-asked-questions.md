@@ -73,7 +73,7 @@ Note: Streaming does not shuffle the data and does not automatically create a va
 When resuming training with streaming, the data can only be indexed forward, not randomly. Skipping already trained data is very time-consuming, so using streaming for resuming is not recommended.
 
 ### Q15: Issues related to packing
-Packing should be used with FlashAttention; otherwise, there will be discrepancies, and the attention_mask will have issues. The packing_cache parameter needs to be set to a shared disk path for multi-node training.
+Packing should be used with FlashAttention; otherwise, there will be discrepancies, and the attention_mask will have issues.
 The linear-attention in the Qwen3.5 model does not support var_len, so enabling packing is not recommended.
 When packing is enabled, multimodal data will undergo two map operations: one for the dataset and one for the template. If this is very slow, you can set `OMP_NUM_THREADS=14` to accelerate it, or disable packing to avoid the second mapping.
 
@@ -339,6 +339,12 @@ Swift is compatible with different versions of qwen-vl-utils, so you do not need
 
 ### Q20: I got an error: safetensors_rust.SafetensorError: Error while deserializing header:MetadataIncompleteBuffer
 The model weights are corrupted.
+
+### Q21: How can I handle this vLLM error: `ValueError: the decoder prompt contains a(n) video item with length 16758, which exceeds the pre-allocated encoder cache size 16384. please reduce the input size or increase the encoder cache size by setting --limit-mm-per-prompt at startup.`?
+This usually means the multimodal input is too long and exceeds vLLM's pre-allocated encoder cache size. You can adjust the encoder cache size with `--limit-mm-per-prompt`. Another practical workaround is to increase `max_num_batched_tokens`. In Swift cli:
+```shell
+--vllm_engine_kwargs '{"max_num_batched_tokens": 20000}'
+```
 
 ## Export
 
